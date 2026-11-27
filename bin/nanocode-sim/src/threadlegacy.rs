@@ -629,6 +629,27 @@ pub async fn expected(
     })
 }
 
+fn resolved(state: &ThreadState, seq: u64, fact: &StoredFact) -> StoredFact {
+    if state.legacy().is_some_and(|legacy| seq <= legacy.last_fact) {
+        return fact.clone();
+    }
+    let resolved: Result<StoredFact, std::convert::Infallible> = fact.try_map(
+        |value| {
+            Ok(match value {
+                Value::Blob(blob) => state
+                    .blob_digest(*blob)
+                    .and_then(|digest| state.blob_body(digest))
+                    .and_then(|body| RawValue::from_string(body.to_owned()).ok())
+                    .map_or(Value::Blob(*blob), Value::Inline),
+                Value::Inline(json) => Value::Inline(json.clone()),
+            })
+        },
+        |decision| Ok(decision.clone()),
+    );
+    let Ok(resolved) = resolved;
+    resolved
+}
+
 pub fn ours(
     state: &ThreadState,
     legacy: &Legacy,
@@ -648,7 +669,7 @@ pub fn ours(
         events: events.iter().map(line).collect(),
         facts: facts
             .iter()
-            .map(|(seq, held, fact)| line(&(seq, held, fact)))
+            .map(|(seq, held, fact)| line(&(seq, held, resolved(state, *seq, fact))))
             .collect(),
         cells: state
             .cells()

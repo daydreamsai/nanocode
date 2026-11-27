@@ -1177,7 +1177,7 @@ fn agrees(rng: &mut Rng, world: &World, log: ThreadLog, thread: &str, stats: &mu
     let checked = driven(
         world,
         "a session fold",
-        threadsessions::agrees(rng, log, thread, &mut sessions),
+        threadsessions::agrees(rng, &ThreadFacts::new(Arc::new(log)), thread, &mut sessions),
     );
     world.sessions.borrow_mut().insert(thread.to_owned(), sessions);
     match checked {

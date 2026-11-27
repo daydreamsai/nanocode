@@ -3,7 +3,7 @@ use std::{ops::Range, sync::Arc};
 use nanocode::{
     backend::Prompt,
     session_host::{LogEntry, Submission, Submitted, TurnState},
-    turnlog::{LogHost, OneLog, Policy, ThreadFacts, ThreadLog, ThreadState},
+    turnlog::{LogHost, OneLog, Policy, ThreadState},
 };
 use nanocode_durability_core::{
     Decision, DurableFold, Fact, FactLog, FactLogs, FoldError, Folded, Input, InputKind, ModelOut,
@@ -75,6 +75,7 @@ pub(crate) struct Expected {
 
 pub(crate) struct Sessions {
     pub next: u64,
+    pub ids: Vec<String>,
     pub turns: u64,
     pub bytes: u64,
     system: Box<RawValue>,
@@ -227,8 +228,9 @@ pub(crate) async fn write(
         "s".repeat(VALUE_INLINE_BYTES)
     ));
     let turns = turns(rng);
-    for at in 0..turns {
-        turn(rng, &log, &scoped, &mut folds, &system, &format!("old{at}")).await?;
+    let ids: Vec<String> = (0..turns).map(|at| format!("old{at}")).collect();
+    for id in &ids {
+        turn(rng, &log, &scoped, &mut folds, &system, id).await?;
     }
     let mut expected = Vec::with_capacity(states.len());
     for ((state, fold), facts) in states.into_iter().zip(folds).zip(&scoped) {
@@ -261,6 +263,7 @@ pub(crate) async fn write(
         .sum();
     Ok(Sessions {
         next,
+        ids,
         turns,
         bytes,
         system,
@@ -323,11 +326,10 @@ pub(crate) fn held(state: &ThreadState, thread: &str, sessions: &Sessions) -> Re
 
 pub(crate) async fn agrees(
     rng: &mut Rng,
-    log: ThreadLog,
+    facts: &dyn FactLogs,
     thread: &str,
     sessions: &mut Sessions,
 ) -> Result<u64, String> {
-    let facts = ThreadFacts::new(Arc::new(log));
     let mut checked = 0;
     for expected in &mut sessions.expected {
         let scoped = facts.scoped(&expected.state, false);

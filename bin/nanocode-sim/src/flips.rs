@@ -25,6 +25,7 @@ use crate::{
     executor::Clock,
     rng::{FNV_OFFSET, Rng, fnv},
     threadcompat, threadlegacy,
+    threadsessions::{self, Sessions},
     threadscope::{Node, PARTS, World, driven, flag, publish, raw},
 };
 
@@ -36,6 +37,7 @@ const HANDOFF_PPM: u64 = 250_000;
 const LEGACY_PPM: u64 = 500_000;
 const START_LEGACY_PPM: u64 = 500_000;
 const START_STAMPED_PPM: u64 = 500_000;
+const SESSIONS_PPM: u64 = 500_000;
 const RECENT_ROWS: usize = 1 << 16;
 const DRIVEN: [&str; 2] = ["thread_path", "row_format"];
 const RESTARTS: u64 = 2 * ROUNDS.end;
@@ -45,16 +47,23 @@ pub enum FlipsMutation {
     None,
     FlipOffUnreadable,
     LegacyOpenClaims,
+    ResidentDropsBlob,
 }
 
 impl FlipsMutation {
-    const ALL: [Self; 3] = [Self::None, Self::FlipOffUnreadable, Self::LegacyOpenClaims];
+    const ALL: [Self; 4] = [
+        Self::None,
+        Self::FlipOffUnreadable,
+        Self::LegacyOpenClaims,
+        Self::ResidentDropsBlob,
+    ];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::FlipOffUnreadable => "flip_off_unreadable",
             Self::LegacyOpenClaims => "legacy_open_claims",
+            Self::ResidentDropsBlob => "resident_drops_blob",
         }
     }
 
@@ -63,6 +72,7 @@ impl FlipsMutation {
             Self::None => Mutation::None,
             Self::FlipOffUnreadable => Mutation::FlipOffUnreadable,
             Self::LegacyOpenClaims => Mutation::LegacyOpenClaims,
+            Self::ResidentDropsBlob => Mutation::ResidentDropsBlob,
         }
     }
 
@@ -93,6 +103,7 @@ pub struct FlipsStats {
     pub handoffs: u64,
     pub acked: u64,
     pub checked: u64,
+    pub sessions: u64,
 }
 
 impl FlipsStats {
@@ -106,6 +117,7 @@ impl FlipsStats {
         self.handoffs += other.handoffs;
         self.acked += other.acked;
         self.checked += other.checked;
+        self.sessions += other.sessions;
     }
 }
 
@@ -138,6 +150,7 @@ struct Run {
     turns: u64,
     ids: Vec<String>,
     acked: BTreeMap<String, Acked>,
+    sessions: Option<Sessions>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -624,12 +637,71 @@ fn round(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) ->
         false,
         &format!("after a flip to {}", to.setting()),
         stats,
-    )
+    )?;
+    sessions(rng, world, run, stats)
+}
+
+fn sessions(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) -> Option<()> {
+    let Some(mut sessions) = run.sessions.take() else {
+        return Some(());
+    };
+    if run.over.path() == ThreadPath::Resident
+        && let Some(Ok(log)) = driven(world, "a flips get", run.node.logs.get(THREAD))
+        && let Some(state) = log.state()
+        && let Err(error) = threadsessions::held(&state, THREAD, &sessions)
+    {
+        flag(&world.wrong, format!("flips: {error}"));
+        return None;
+    }
+    let states = match driven(world, "a flips state store", run.over.states())? {
+        Ok(states) => states,
+        Err(error) => {
+            failed(world, run, "the state store", &error);
+            return None;
+        }
+    };
+    let Some(logs) = states.facts() else {
+        flag(&world.wrong, "flips: the state store offers no fact log".to_owned());
+        return None;
+    };
+    let checked = driven(
+        world,
+        "a flips session fold",
+        threadsessions::agrees(rng, &*logs, THREAD, &mut sessions),
+    )?;
+    match checked {
+        Ok(checked) => stats.sessions += checked,
+        Err(error) => {
+            flag(
+                &world.wrong,
+                format!("flips: on the {} path, {error}", run.over.path().setting()),
+            );
+            return None;
+        }
+    }
+    run.sessions = Some(sessions);
+    Some(())
 }
 
 fn started(rng: &mut Rng, world: &World) -> Option<Run> {
     let mut ids = Vec::new();
-    if rng.chance(LEGACY_PPM) {
+    let mut sessions = None;
+    if rng.chance(LEGACY_PPM) && rng.chance(SESSIONS_PPM) {
+        match driven(
+            world,
+            "an old writer's sessions",
+            threadsessions::write(rng, world.host(), THREAD),
+        )? {
+            Ok(written) => {
+                ids.extend(written.ids.iter().cloned());
+                sessions = Some(written);
+            }
+            Err(error) => {
+                flag(&world.wrong, format!("flips: the old writer's sessions: {error}"));
+                return None;
+            }
+        }
+    } else if rng.chance(LEGACY_PPM) {
         let written = driven(
             world,
             "an old path history",
@@ -658,6 +730,7 @@ fn started(rng: &mut Rng, world: &World) -> Option<Run> {
         turns: 0,
         ids,
         acked: BTreeMap::new(),
+        sessions,
     })
 }
 
