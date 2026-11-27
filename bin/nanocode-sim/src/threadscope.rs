@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroU32,
     ops::Range,
     process::ExitCode,
@@ -22,8 +22,8 @@ use nanocode::{
     },
 };
 use nanocode_durability_core::{
-    DurableFold, FactLogs, FoldError, Input, InputKind, OwnedFact, Seen, StoreError, StoreFuture,
-    VALUE_INLINE_BYTES, commit_fact, fold_facts,
+    BlobRef, Digest, DurableFold, FactLogs, FoldError, Input, InputKind, OwnedFact, Seen,
+    StoreError, StoreFuture, VALUE_INLINE_BYTES, commit_fact, fold_facts,
 };
 use nanocode_scope::{
     Checkpoints, ClaimHook, Committed, Manifest, MemoryCheckpoints, Part, PartedLeases, Policy, Resident,
@@ -32,7 +32,7 @@ use nanocode_scope::{
 };
 use nanocode_sync::{Atom, block_on};
 use nanocode_turnlog::{
-    Fold, Hold, LogHost, Phase, Record, SCAN_END, Status, Wake,
+    CachedAt, FOLD_SNAPSHOT_KEY, Fold, Hold, LogHost, Phase, Record, SCAN_END, Status, Wake,
     sim::Mutation as TurnLogMutation,
     parted::{ModelParts, PartStore, PartedLog},
 };
@@ -193,6 +193,9 @@ pub struct ThreadScopeStats {
     pub session_caches: u64,
     pub session_rows_bytes: u64,
     pub adoption_bytes: u64,
+    pub adopted_bounded: u64,
+    pub adopted_parts_max: u64,
+    pub adopted_bytes_max: u64,
     pub stamps_settled: u64,
     pub stamps_uncertain: u64,
     pub stamps_dropped: u64,
@@ -263,6 +266,9 @@ impl ThreadScopeStats {
         self.session_caches += other.session_caches;
         self.session_rows_bytes += other.session_rows_bytes;
         self.adoption_bytes += other.adoption_bytes;
+        self.adopted_bounded += other.adopted_bounded;
+        self.adopted_parts_max = self.adopted_parts_max.max(other.adopted_parts_max);
+        self.adopted_bytes_max = self.adopted_bytes_max.max(other.adopted_bytes_max);
         self.stamps_settled += other.stamps_settled;
         self.stamps_uncertain += other.stamps_uncertain;
         self.stamps_dropped += other.stamps_dropped;
@@ -1075,6 +1081,60 @@ fn decoded(world: &World, manifest: &Manifest) -> Result<ThreadState, String> {
     world.fold.decode(parts).map_err(|error| error.to_string())
 }
 
+fn cached_blobs(state: &ThreadState) -> BTreeSet<Digest> {
+    state
+        .hosts()
+        .filter(|(key, _)| {
+            key.strip_prefix(FOLD_SNAPSHOT_KEY)
+                .is_some_and(|rest| rest.starts_with('\n'))
+        })
+        .filter_map(|(_, value)| serde_json::from_str::<CachedAt>(value.get()).ok())
+        .map(|at| at.blob)
+        .collect()
+}
+
+fn left(world: &World, thread: &str, manifest: &Manifest, state: &ThreadState, stats: &mut ThreadScopeStats) -> bool {
+    let finished: Vec<&str> = state
+        .turns()
+        .filter(|turn| matches!(turn.phase, Phase::Finished { .. }))
+        .map(|turn| turn.id.as_str())
+        .collect();
+    if !finished.is_empty() {
+        flag(
+            &world.wrong,
+            format!(
+                "the adopted checkpoint of {thread} at row {} holds finished turns {finished:?}, which belong to its old log",
+                manifest.seq
+            ),
+        );
+        return false;
+    }
+    let cached = cached_blobs(state);
+    let held: Vec<u32> = (0_u32..)
+        .map_while(|index| state.blob_digest(BlobRef::from_index(index)).map(|digest| (index, digest)))
+        .filter(|(_, digest)| !cached.contains(*digest) && state.blob_body(digest).is_some())
+        .map(|(index, _)| index)
+        .collect();
+    if !held.is_empty() {
+        flag(
+            &world.wrong,
+            format!(
+                "the adopted checkpoint of {thread} at row {} holds the bodies of blobs {held:?}, which no cached fold names",
+                manifest.seq
+            ),
+        );
+        return false;
+    }
+    let digests: Vec<String> = manifest.parts.iter().map(|(_, at)| at.clone()).collect();
+    let bytes: u64 = block_on(world.witness.parts(&digests))
+        .map(|found| found.iter().map(|(_, body)| body.len() as u64).sum())
+        .unwrap_or(0);
+    stats.adopted_bounded += 1;
+    stats.adopted_parts_max = stats.adopted_parts_max.max(manifest.parts.len() as u64);
+    stats.adopted_bytes_max = stats.adopted_bytes_max.max(bytes);
+    true
+}
+
 fn adopted(world: &World, thread: &str, stats: &mut ThreadScopeStats) {
     let Some((legacy, theirs)) = world.legacy.get(thread) else {
         return;
@@ -1106,6 +1166,9 @@ fn adopted(world: &World, thread: &str, stats: &mut ThreadScopeStats) {
             return;
         }
     };
+    if !left(world, thread, &first, &state, stats) {
+        return;
+    }
     let paging = thread_history::Paging::new(None, usize::MAX, None);
     let events = driven(
         world,
@@ -1117,12 +1180,17 @@ fn adopted(world: &World, thread: &str, stats: &mut ThreadScopeStats) {
         "an adopted fact read",
         thread_history::facts(&world.host, thread, &state, 0, None),
     );
-    let (Some(Ok(events)), Some(Ok(facts))) = (events, facts) else {
+    let turns = driven(
+        world,
+        "an adopted turn probe",
+        threadlegacy::turns(&world.host, thread, &state, legacy),
+    );
+    let (Some(Ok(events)), Some(Ok(facts)), Some(Ok(turns))) = (events, facts, turns) else {
         flag(&world.wrong, format!("the adopted history of {thread} does not read back"));
         return;
     };
     stats.adopted_checks += 1;
-    let ours = threadlegacy::ours(&state, legacy, &events.events, &facts);
+    let ours = threadlegacy::ours(&state, legacy, turns, &events.events, &facts);
     if let Some(difference) = threadlegacy::differs(theirs, &ours) {
         flag(
             &world.wrong,
@@ -1137,7 +1205,7 @@ fn adopted(world: &World, thread: &str, stats: &mut ThreadScopeStats) {
 }
 
 fn sessions(world: &World, thread: &str, log: &ThreadLog, stats: &mut ThreadScopeStats) -> bool {
-    if !session_base(world, thread) {
+    if !session_base(world, thread, stats) {
         return false;
     }
     let Some(state) = log.state() else {
@@ -1146,7 +1214,7 @@ fn sessions(world: &World, thread: &str, log: &ThreadLog, stats: &mut ThreadScop
     held(world, thread, &state, stats)
 }
 
-fn session_base(world: &World, thread: &str) -> bool {
+fn session_base(world: &World, thread: &str, stats: &mut ThreadScopeStats) -> bool {
     let Some(next) = world.sessions.borrow().get(thread).map(|sessions| sessions.next) else {
         return false;
     };
@@ -1170,6 +1238,9 @@ fn session_base(world: &World, thread: &str) -> bool {
         }
         match decoded(world, &first) {
             Ok(state) => {
+                if !left(world, thread, &first, &state, stats) {
+                    return false;
+                }
                 world
                     .bases
                     .borrow_mut()
@@ -1343,7 +1414,7 @@ fn colds(world: &World, stats: &mut ThreadScopeStats) {
     for thread in &world.threads {
         if !world.witness.manifests(thread).is_empty() {
             adopted(world, thread, stats);
-            session_base(world, thread);
+            session_base(world, thread, stats);
         }
         renumbered(world, thread);
         let Some(loaded) = cold(world, thread, stats) else {

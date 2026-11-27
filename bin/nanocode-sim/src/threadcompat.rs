@@ -211,14 +211,19 @@ pub(crate) fn resident(
         "a compat fact read",
         thread_history::facts(host, thread, state, 0, None),
     )?;
-    let (Ok(events), Ok(facts)) = (events, facts) else {
+    let turns = driven(
+        world,
+        "a compat turn probe",
+        threadlegacy::turns(host, thread, state, &probe),
+    )?;
+    let (Ok(events), Ok(facts), Ok(turns)) = (events, facts, turns) else {
         flag(
             &world.wrong,
             format!("compat: {when}, the resident history does not read back"),
         );
         return None;
     };
-    let ours = threadlegacy::ours(state, &probe, &events.events, &facts);
+    let ours = threadlegacy::ours(state, &probe, turns, &events.events, &facts);
     if let Some(difference) = threadlegacy::differs(&theirs, &ours) {
         flag(
             &world.wrong,

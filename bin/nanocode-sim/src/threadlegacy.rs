@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
-use nanocode::{backend::Prompt, turnlog::ThreadState};
+use nanocode::{
+    backend::Prompt,
+    turnlog::{Found, Probes, ThreadState, thread_history},
+};
 use nanocode_durability_core::{
     Decision, Digest, Fact, Input, InputKind, Marker, Outcome as FactOutcome, StoreError,
     StoredFact, TurnStatus, VALUE_INLINE_BYTES, Value,
@@ -650,9 +653,28 @@ fn resolved(state: &ThreadState, seq: u64, fact: &StoredFact) -> StoredFact {
     resolved
 }
 
+pub async fn turns(
+    host: &Arc<dyn LogHost>,
+    thread: &str,
+    state: &ThreadState,
+    legacy: &Legacy,
+) -> Result<Vec<String>, StoreError> {
+    let mut turns = Vec::with_capacity(legacy.ids.len());
+    for id in &legacy.ids {
+        let turn = match state.found(id, &Probes::default()) {
+            Found::Turn(turn) => Some(turn),
+            Found::Absent => None,
+            Found::Probe(probing) => thread_history::probe(host, thread, &probing).await?.turn,
+        };
+        turns.extend(turn.as_deref().map(turn_line));
+    }
+    Ok(turns)
+}
+
 pub fn ours(
     state: &ThreadState,
     legacy: &Legacy,
+    turns: Vec<String>,
     events: &[Event],
     facts: &[(u64, Option<String>, StoredFact)],
 ) -> View {
@@ -661,11 +683,7 @@ pub fn ours(
     View {
         retired: 0,
         blobs: 0,
-        turns: legacy
-            .ids
-            .iter()
-            .filter_map(|id| state.turn(id).map(turn_line))
-            .collect(),
+        turns,
         events: events.iter().map(line).collect(),
         facts: facts
             .iter()

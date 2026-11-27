@@ -113,6 +113,7 @@ pub struct Probing {
     pub request_id: String,
     pub from: u64,
     pub to: u64,
+    pub legacy: Option<Legacy>,
 }
 
 #[derive(Clone, Debug)]
@@ -209,6 +210,7 @@ impl ThreadState {
                 request_id: id.to_owned(),
                 from: self.legacy.map_or(0, |legacy| legacy.next),
                 to: moved.below,
+                legacy: self.legacy,
             }),
         }
     }
@@ -216,6 +218,33 @@ impl ThreadState {
     #[must_use]
     pub const fn moved(&self) -> Option<&Moved> {
         self.moved.as_ref()
+    }
+
+    pub(crate) fn moved_below(&mut self, id: &str, below: u64, filter: FinishedFilter) {
+        assert!(below > 0, "a turn moves into the history below a row");
+        assert!(
+            !self.turns.contains_key(id),
+            "a turn moves into the history only while it is not resident"
+        );
+        self.moved
+            .get_or_insert_with(|| Moved::new(filter))
+            .insert(id, below - 1);
+    }
+
+    pub(crate) fn seeded(&mut self, turn: Turn) {
+        let id: Arc<str> = Arc::from(turn.id.as_str());
+        assert!(
+            self.turns.is_empty(),
+            "a probe seeds its trace with at most one turn"
+        );
+        self.admitted.insert(turn.first, Arc::clone(&id));
+        self.turns.insert(id, Arc::new(turn));
+    }
+
+    pub fn hosts(&self) -> impl Iterator<Item = (&str, &RawValue)> {
+        self.hosts
+            .iter()
+            .map(|(key, value)| (key.as_ref(), value.as_ref()))
     }
 
     pub fn traced(&mut self, record: &Record, row: u64, id: &str) -> Result<(), StoreError> {

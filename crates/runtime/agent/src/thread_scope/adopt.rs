@@ -167,7 +167,16 @@ fn retired_turn(id: String, retired: &Retired, events: &[Event]) -> Result<Turn,
     })
 }
 
-fn turns(state: &mut ThreadState, view: &mut View, events: &[Event]) -> Result<(), StoreError> {
+fn keeps_history() -> bool {
+    sim::mutated(Mutation::AdoptionKeepsHistory)
+}
+
+fn turns(
+    state: &mut ThreadState,
+    view: &mut View,
+    below: u64,
+    filter: FinishedFilter,
+) -> Result<(), StoreError> {
     if view.retired.len() != view.retired_count {
         return Err(invalid(format!(
             "the turn log retired {} turns and its events name {} of them",
@@ -175,13 +184,17 @@ fn turns(state: &mut ThreadState, view: &mut View, events: &[Event]) -> Result<(
             view.retired.len()
         )));
     }
-    let mut turns = std::mem::take(&mut view.turns);
     if !sim::mutated(Mutation::AdoptionSkipsRetired) {
-        for (id, retired) in std::mem::take(&mut view.retired) {
-            turns.push(retired_turn(id, &retired, events)?);
+        for (id, _) in std::mem::take(&mut view.retired) {
+            state.moved_below(&id, below, filter);
         }
     }
-    for turn in turns {
+    for turn in std::mem::take(&mut view.turns) {
+        let finished = matches!(turn.phase, Phase::Finished { .. });
+        if finished && !keeps_history() {
+            state.moved_below(&turn.id, below, filter);
+            continue;
+        }
         let id: Arc<str> = Arc::from(turn.id.as_str());
         if state.admitted.insert(turn.first, Arc::clone(&id)).is_some() {
             return Err(invalid(format!(
@@ -189,31 +202,55 @@ fn turns(state: &mut ThreadState, view: &mut View, events: &[Event]) -> Result<(
                 turn.first
             )));
         }
+        if !finished {
+            state.starts.insert(Arc::clone(&id), below);
+        }
         if state.turns.insert(id, Arc::new(turn)).is_some() {
             return Err(invalid("the turn log holds one turn twice"));
         }
     }
+    view.models
+        .retain(|(turn, _)| state.turns.contains_key(turn.as_str()));
     Ok(())
 }
 
-fn events(events: &[Event], last_event: u64) -> Result<(), StoreError> {
-    for pair in events.windows(2) {
-        if pair[1].seq <= pair[0].seq {
+#[derive(Default)]
+struct Seen {
+    ids: BTreeSet<String>,
+    last: Option<u64>,
+    disorder: Option<(u64, u64)>,
+}
+
+impl Seen {
+    fn take(&mut self, event: &Event) -> bool {
+        if let Some(last) = self.last
+            && event.seq <= last
+            && self.disorder.is_none()
+        {
+            self.disorder = Some((last, event.seq));
+        }
+        self.last = Some(self.last.map_or(event.seq, |last| last.max(event.seq)));
+        if let Some(turn) = &event.turn {
+            self.ids.insert(turn.clone());
+        }
+        true
+    }
+
+    fn checked(&self, last_event: u64) -> Result<(), StoreError> {
+        if let Some((before, after)) = self.disorder {
             return Err(invalid(format!(
-                "the turn log answers event {} after event {}",
-                pair[1].seq, pair[0].seq
+                "the turn log answers event {after} after event {before}"
             )));
         }
+        if let Some(last) = self.last
+            && last > last_event
+        {
+            return Err(invalid(format!(
+                "the turn log answers event {last} past its last event {last_event}"
+            )));
+        }
+        Ok(())
     }
-    if let Some(last) = events.last()
-        && last.seq > last_event
-    {
-        return Err(invalid(format!(
-            "the turn log answers event {} past its last event {last_event}",
-            last.seq
-        )));
-    }
-    Ok(())
 }
 
 fn facts(state: &mut ThreadState, facts: &Facts) -> Result<(), StoreError> {
@@ -287,7 +324,11 @@ async fn bodies(
     state: &mut ThreadState,
     cached: &BTreeSet<Digest>,
 ) -> Result<(), StoreError> {
-    let named: BTreeSet<Digest> = state.blobs.iter().chain(cached).copied().collect();
+    let named: BTreeSet<Digest> = if keeps_history() {
+        state.blobs.iter().chain(cached).copied().collect()
+    } else {
+        cached.clone()
+    };
     let wanted: Vec<Digest> = named
         .into_iter()
         .filter(|digest| !(cached.contains(digest) && sim::mutated(Mutation::ResidentDropsBlob)))
@@ -404,9 +445,52 @@ pub(super) async fn legacy_facts(
         .collect()
 }
 
+pub(super) async fn legacy_turn(
+    log: &Arc<dyn LogHost>,
+    scope: &str,
+    legacy: Legacy,
+    id: &str,
+) -> Result<Option<Turn>, StoreError> {
+    let opened = opened(log, scope, legacy).await?;
+    let wanted = id.to_owned();
+    let (turn, retired) = opened
+        .read(move |fold| match fold.turn(&wanted) {
+            Some(turn) => (Some(turn.clone()), None),
+            None => (None, fold.retired(&wanted).cloned()),
+        })
+        .await;
+    let Some(retired) = retired else {
+        return Ok(turn);
+    };
+    let last = retired.last;
+    let events = opened
+        .history(last.saturating_sub(1), Vec::new(), move |events: &mut Vec<Event>, event| {
+            if event.seq == last {
+                events.push(event.clone());
+            }
+            event.seq < last
+        })
+        .await?;
+    retired_turn(id.to_owned(), &retired, &events).map(Some)
+}
+
+fn unheld(state: &ThreadState, view: &mut View, cached: &BTreeSet<Digest>) {
+    if keeps_history() {
+        return;
+    }
+    let history: BTreeSet<String> = state
+        .blobs
+        .iter()
+        .filter(|digest| !cached.contains(digest))
+        .map(|digest| digest.key().as_str().to_owned())
+        .collect();
+    view.stored.retain(|(key, _)| !history.contains(key));
+}
+
 pub(super) async fn adopt(
     log: &Arc<dyn LogHost>,
     scope: &str,
+    filter: FinishedFilter,
 ) -> Result<Option<Adopted<ThreadState>>, StoreError> {
     let loaded = log.load(scope).await?;
     if loaded.is_empty() || plain(&loaded) {
@@ -414,29 +498,24 @@ pub(super) async fn adopt(
     }
     let legacy = adopt::read_all(log, scope, Reading::Loaded(loaded)).await?;
     let next = legacy.next();
-    let history = legacy
-        .history(0, Vec::new(), |events: &mut Vec<Event>, event| {
-            events.push(event.clone());
-            true
-        })
+    let seen = legacy
+        .history(0, Seen::default(), |seen: &mut Seen, event| seen.take(event))
         .await?;
     let read = legacy
         .facts_from(0, Vec::new(), |facts: &mut Facts, seq, owner, fact| {
             facts.push((seq, owner.map(str::to_owned), fact.clone()));
         })
         .await?;
-    let ids: BTreeSet<String> = history
-        .iter()
-        .filter_map(|event| event.turn.clone())
-        .collect();
+    let ids = seen.ids.clone();
     let (mut view, last_event) = legacy
         .read(move |fold| (View::of(fold, &ids), fold.last_event()))
         .await;
+    seen.checked(last_event)?;
     let mut state = ThreadState::default();
-    turns(&mut state, &mut view, &history)?;
-    events(&history, last_event)?;
+    turns(&mut state, &mut view, next, filter)?;
     facts(&mut state, &read)?;
     let cached = cached_blobs(&view);
+    unheld(&state, &mut view, &cached);
     keep(&mut state, view);
     bodies(&legacy, &mut state, &cached).await?;
     state.last_event = last_event;

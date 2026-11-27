@@ -127,6 +127,11 @@ pub async fn probe(
         Vec::new()
     };
     let mut traced = ThreadState::default();
+    if let Some(legacy) = probing.legacy
+        && let Some(turn) = adopt::legacy_turn(host, scope, legacy, &probing.request_id).await?
+    {
+        traced.seeded(turn);
+    }
     for (seq, body) in rows {
         for record in super::state::records(seq, &body)? {
             traced.traced(&record, seq, &probing.request_id)?;

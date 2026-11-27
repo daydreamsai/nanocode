@@ -790,7 +790,7 @@ impl Resident for ThreadFold {
         log: &'a Arc<dyn LogHost>,
         scope: &'a str,
     ) -> StoreFuture<'a, Result<Option<Adopted<ThreadState>>, StoreError>> {
-        Box::pin(adopt::adopt(log, scope))
+        Box::pin(adopt::adopt(log, scope, self.policy.finished_filter))
     }
 }
 
