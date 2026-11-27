@@ -1,16 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 use nanocode_scope::Adopted;
-use nanocode_sync::Slot;
 use nanocode_turnlog::{
-    ArmedWake, Checkpoint, Compaction, Event, Extension, Fold, Hold, LogHost, OpenCall, Phase,
-    RETIRED_KEY, Retired, Rider, ScopeRows, StoredCheckpoint, Turn, TurnLog, Write,
+    ArmedWake, Checkpoint, Event, Fold, Hold, LogHost, OpenCall, Phase, RETIRED_KEY, Retired,
+    Turn,
+    adopt::{self, Adoption, Reading},
 };
 use serde_json::value::RawValue;
 
@@ -20,152 +17,11 @@ use super::{
     state::{FinishedFilter, Legacy, ThreadState, Window, invalid},
 };
 use crate::durability::{
-    StoreError, StoreFuture,
+    StoreError,
     facts::{BlobRef, Digest, StoredFact, Value},
 };
 
 pub(crate) const RETIRED_DIGEST: &str = "retired:";
-
-struct Counted {
-    log: Arc<dyn LogHost>,
-    loaded: Slot<Vec<(u64, String)>>,
-    below: u64,
-    rows: AtomicU64,
-    bytes: AtomicU64,
-}
-
-impl Counted {
-    fn new(log: &Arc<dyn LogHost>, below: u64) -> Self {
-        Self {
-            log: Arc::clone(log),
-            loaded: Slot::new(None),
-            below,
-            rows: AtomicU64::new(0),
-            bytes: AtomicU64::new(0),
-        }
-    }
-
-    fn kept(&self, mut rows: Vec<(u64, String)>) -> Vec<(u64, String)> {
-        rows.retain(|(seq, _)| *seq < self.below);
-        self.count(&rows);
-        rows
-    }
-
-    fn count(&self, rows: &[(u64, String)]) {
-        let bytes: usize = rows.iter().map(|(_, body)| body.len()).sum();
-        self.rows.fetch_add(rows.len() as u64, Ordering::Relaxed);
-        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-}
-
-fn refused(scope: &str) -> ! {
-    panic!("the adoption of {scope} reads the turn log and writes nothing to it")
-}
-
-impl LogHost for Counted {
-    fn call_bound(&self) -> Option<std::time::Duration> {
-        self.log.call_bound()
-    }
-
-    fn read_capacity(&self) -> u32 {
-        self.log.read_capacity()
-    }
-
-    fn scan<'a>(
-        &'a self,
-        scope: &'a str,
-        from: u64,
-        to: u64,
-    ) -> StoreFuture<'a, Result<Vec<(u64, String)>, StoreError>> {
-        Box::pin(async move {
-            let to = to.min(self.below);
-            if from >= to {
-                return Ok(Vec::new());
-            }
-            Ok(self.kept(self.log.scan(scope, from, to).await?))
-        })
-    }
-
-    fn scans<'a>(
-        &'a self,
-        scans: &'a [(&'a str, u64)],
-    ) -> StoreFuture<'a, Result<Vec<ScopeRows>, StoreError>> {
-        Box::pin(async move {
-            let scanned = self.log.scans(scans).await?;
-            Ok(scanned.into_iter().map(|rows| self.kept(rows)).collect())
-        })
-    }
-
-    fn load<'a>(
-        &'a self,
-        scope: &'a str,
-    ) -> StoreFuture<'a, Result<Vec<(u64, String)>, StoreError>> {
-        Box::pin(async move {
-            if let Some(rows) = self.loaded.take() {
-                return Ok(rows);
-            }
-            Ok(self.kept(self.log.load(scope).await?))
-        })
-    }
-
-    fn append<'a>(
-        &'a self,
-        scope: &'a str,
-        _rows: &'a [(u64, String)],
-    ) -> StoreFuture<'a, Result<(), StoreError>> {
-        refused(scope)
-    }
-
-    fn append_compacting<'a>(
-        &'a self,
-        scope: &'a str,
-        _rows: &'a [(u64, String)],
-        _compaction: Compaction<'a>,
-    ) -> StoreFuture<'a, Result<(), StoreError>> {
-        refused(scope)
-    }
-
-    fn extend<'a>(
-        &'a self,
-        scope: &'a str,
-        _extension: Extension<'a>,
-    ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
-        refused(scope)
-    }
-
-    fn carry<'a>(
-        &'a self,
-        scope: &'a str,
-        _write: Write<'a>,
-        _rider: Rider<'a>,
-    ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
-        refused(scope)
-    }
-
-    fn checkpoint<'a>(
-        &'a self,
-        scope: &'a str,
-    ) -> Option<StoreFuture<'a, Result<Option<StoredCheckpoint>, StoreError>>> {
-        let read = self.log.checkpoint(scope)?;
-        Some(Box::pin(async move {
-            let checkpoint = read.await?;
-            if let Some(checkpoint) = &checkpoint {
-                self.rows.fetch_add(1, Ordering::Relaxed);
-                self.bytes
-                    .fetch_add(checkpoint.body.len() as u64, Ordering::Relaxed);
-            }
-            Ok(checkpoint)
-        }))
-    }
-
-    fn save_checkpoint<'a>(
-        &'a self,
-        scope: &'a str,
-        _checkpoint: &'a StoredCheckpoint,
-    ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
-        refused(scope)
-    }
-}
 
 fn plain(rows: &[(u64, String)]) -> bool {
     let mut state = ThreadState::default();
@@ -415,7 +271,7 @@ fn keep(state: &mut ThreadState, view: View) {
 }
 
 async fn values(
-    legacy: &TurnLog,
+    legacy: &Adoption,
     digests: &[(BlobRef, Option<Digest>)],
 ) -> Result<BTreeMap<u32, Box<RawValue>>, StoreError> {
     let mut wanted = Vec::with_capacity(digests.len());
@@ -446,10 +302,9 @@ async fn opened(
     log: &Arc<dyn LogHost>,
     scope: &str,
     legacy: Legacy,
-) -> Result<TurnLog, StoreError> {
-    let counted = Arc::new(Counted::new(log, legacy.next));
-    let opened = TurnLog::open(counted as Arc<dyn LogHost>, scope).await?;
-    let next = opened.load_all().await?;
+) -> Result<Adoption, StoreError> {
+    let opened = adopt::read_all(log, scope, Reading::Below(legacy.next)).await?;
+    let next = opened.next();
     if next != legacy.next {
         return Err(invalid(format!(
             "the turn log history of {scope} ends at row {next}, not at row {} where the thread adopted it",
@@ -508,15 +363,12 @@ pub(super) async fn adopt(
     log: &Arc<dyn LogHost>,
     scope: &str,
 ) -> Result<Option<Adopted<ThreadState>>, StoreError> {
-    let counted = Arc::new(Counted::new(log, u64::MAX));
     let loaded = log.load(scope).await?;
-    counted.count(&loaded);
     if loaded.is_empty() || plain(&loaded) {
         return Ok(None);
     }
-    counted.loaded.put(loaded);
-    let legacy = TurnLog::open(Arc::clone(&counted) as Arc<dyn LogHost>, scope).await?;
-    let next = legacy.load_all().await?;
+    let legacy = adopt::read_all(log, scope, Reading::Loaded(loaded)).await?;
+    let next = legacy.next();
     let history = legacy
         .history(0, Vec::new(), |events: &mut Vec<Event>, event| {
             events.push(event.clone());
@@ -546,10 +398,11 @@ pub(super) async fn adopt(
         last_event,
         last_fact: state.fact_base,
     });
+    let usage = legacy.usage();
     Ok(Some(Adopted {
         state,
         next,
-        rows: counted.rows.load(Ordering::Relaxed),
-        bytes: counted.bytes.load(Ordering::Relaxed),
+        rows: usage.rows,
+        bytes: usage.bytes,
     }))
 }

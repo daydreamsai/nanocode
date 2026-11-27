@@ -1,3 +1,4 @@
+pub mod adopt;
 mod bound;
 mod codec;
 mod effect;
