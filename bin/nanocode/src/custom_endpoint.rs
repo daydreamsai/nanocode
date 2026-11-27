@@ -3,6 +3,7 @@ use crate::host::ModelClients;
 const ANTHROPIC_BASE_URL: &str = "NANOCODE_ANTHROPIC_BASE_URL";
 const BASE_URL: &str = "NANOCODE_OPENAI_BASE_URL";
 const MODELS_URL: &str = "NANOCODE_MODELS_URL";
+const SAVED_ANTHROPIC_API_KEY: &str = "anthropic-api-key";
 const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const ANTHROPIC_CREDENTIALS: [(&str, AnthropicCredential); 4] = [
     ("NANOCODE_ANTHROPIC_API_KEY", AnthropicCredential::ApiKey),
@@ -117,12 +118,28 @@ fn anthropic(clients: ModelClients) -> Result<ModelClients, String> {
 }
 
 fn behind_login(clients: ModelClients) -> Result<ModelClients, String> {
-    let Some((name, key)) = ANTHROPIC_CREDENTIALS
+    let home = nanocode_home::AgentHome::from_env().map_err(|error| error.to_string())?;
+    let path = home.nanocode_home().join(SAVED_ANTHROPIC_API_KEY);
+    let (name, key) = match ANTHROPIC_CREDENTIALS
         .iter()
         .filter(|(_, credential)| matches!(credential, AnthropicCredential::ApiKey))
         .find_map(|(name, _)| env(name).map(|key| (*name, key)))
-    else {
-        return Ok(clients);
+    {
+        Some((name, key)) => {
+            nanocode_http::types::header::HeaderValue::from_str(&key)
+                .map_err(|error| format!("{name}: {error}"))?;
+            if let Err(error) = remember(&path, &key) {
+                eprintln!(
+                    "nanocode: could not save {name} to {}: {error}",
+                    path.display()
+                );
+            }
+            (name.to_owned(), key)
+        }
+        None => match saved(&path)? {
+            Some(key) => (path.display().to_string(), key),
+            None => return Ok(clients),
+        },
     };
     nanocode_http::types::header::HeaderValue::from_str(&key)
         .map_err(|error| format!("{name}: {error}"))?;
@@ -130,6 +147,39 @@ fn behind_login(clients: ModelClients) -> Result<ModelClients, String> {
         nanocode::claude::ClaudeClient::subscription_or_key(&key)
             .expect("the Anthropic API key was checked when the clients were built")
     }))
+}
+
+fn saved(path: &std::path::Path) -> Result<Option<String>, String> {
+    use std::io::Read as _;
+    if !path
+        .try_exists()
+        .map_err(|error| format!("{}: {error}", path.display()))?
+    {
+        return Ok(None);
+    }
+    let mut key = String::new();
+    nanocode_home::private::open(path)
+        .map_err(|error| error.to_string())?
+        .read_to_string(&mut key)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(format!(
+            "{} is empty; delete it or set ANTHROPIC_API_KEY",
+            path.display()
+        ));
+    }
+    Ok(Some(key.to_owned()))
+}
+
+fn remember(path: &std::path::Path, key: &str) -> Result<(), String> {
+    if saved(path).ok().flatten().as_deref() == Some(key) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    nanocode_home::private::replace(path, key.as_bytes()).map_err(|error| error.to_string())
 }
 
 fn list(url: &str, key: Option<&(&str, String)>) -> Result<crate::host::Listed, String> {
