@@ -23,10 +23,11 @@ pub enum Mutation {
     ColdLoadDuplicated,
     RoutesPastExpiry,
     LegacyAdmittedIdle,
+    ChainInStoreOrder,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::CheckpointIndexesOnly,
         Self::ReadThroughWriter,
         Self::PublishBeforeCommit,
@@ -42,6 +43,7 @@ impl Mutation {
         Self::RiderSplit,
         Self::MeterSkipsWriterTask,
         Self::RoutesPastExpiry,
+        Self::ChainInStoreOrder,
     ];
 
     pub const ADMISSION: [Self; 4] = [
@@ -74,6 +76,7 @@ impl Mutation {
             Self::ColdLoadDuplicated => "cold_load_duplicated",
             Self::RoutesPastExpiry => "routes_past_expiry",
             Self::LegacyAdmittedIdle => "legacy_admitted_idle",
+            Self::ChainInStoreOrder => "chain_in_store_order",
         }
     }
 

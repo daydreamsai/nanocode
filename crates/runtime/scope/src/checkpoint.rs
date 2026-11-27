@@ -89,8 +89,11 @@ impl Listing {
 
 pub fn assemble(
     scope: &str,
-    rows: Vec<(u64, u64, Listing)>,
+    mut rows: Vec<(u64, u64, Listing)>,
 ) -> Result<Option<Manifest>, StoreError> {
+    if !sim::mutated(Mutation::ChainInStoreOrder) {
+        rows.sort_by_key(|(seq, _, _)| *seq);
+    }
     let mut manifest: Option<Manifest> = None;
     for (seq, epoch, listing) in rows {
         let (parts, changed_bytes) = match (&listing, &manifest) {
@@ -167,9 +170,15 @@ pub struct MemoryStats {
     pub listing_bytes_written: u64,
 }
 
+#[derive(Clone)]
+struct Kept {
+    manifest: Manifest,
+    listing: Listing,
+}
+
 #[derive(Clone, Default)]
 struct Shelf {
-    manifests: OrdMap<Arc<str>, Arc<Vec<Manifest>>>,
+    manifests: OrdMap<Arc<str>, Arc<Vec<Kept>>>,
     parts: OrdMap<String, Arc<str>>,
     stats: MemoryStats,
 }
@@ -196,7 +205,7 @@ impl<S: PartStore + ?Sized> MemoryCheckpoints<S> {
             shelf
                 .manifests
                 .get(scope)
-                .map(|kept| kept.as_ref().clone())
+                .map(|kept| kept.iter().map(|kept| kept.manifest.clone()).collect())
                 .unwrap_or_default()
         })
     }
@@ -223,7 +232,8 @@ impl<S: PartStore + ?Sized> MemoryCheckpoints<S> {
                 .get(manifest.scope.as_str())
                 .cloned()
                 .unwrap_or_default();
-            if let Some(last) = kept.last() {
+            let last = kept.last().map(|kept| &kept.manifest);
+            if let Some(last) = last {
                 if last.seq == manifest.seq && last.epoch == manifest.epoch {
                     return Written::Landed;
                 }
@@ -234,14 +244,14 @@ impl<S: PartStore + ?Sized> MemoryCheckpoints<S> {
             }
             let based = match listing {
                 Listing::Whole(_) => true,
-                Listing::Changed { base, .. } => kept.last().is_some_and(|last| last.seq == *base),
+                Listing::Changed { base, .. } => last.is_some_and(|last| last.seq == *base),
             };
             if !based {
                 shelf.stats.manifests_stale += 1;
                 return Written::Stale;
             }
-            let assembled = listing.applied(kept.last().map_or(&[][..], |last| &last.parts));
-            let changed_bytes = match (listing, kept.last()) {
+            let assembled = listing.applied(last.map_or(&[][..], |last| &last.parts));
+            let changed_bytes = match (listing, last) {
                 (Listing::Changed { .. }, Some(last)) => {
                     last.changed_bytes + listing.encoded().len()
                 }
@@ -255,10 +265,13 @@ impl<S: PartStore + ?Sized> MemoryCheckpoints<S> {
             shelf.stats.listing_bytes_written +=
                 u64::try_from(listing.encoded().len()).unwrap_or(u64::MAX);
             let mut next = kept.as_ref().clone();
-            next.push(Manifest {
-                parts: assembled,
-                changed_bytes,
-                ..manifest.clone()
+            next.push(Kept {
+                manifest: Manifest {
+                    parts: assembled,
+                    changed_bytes,
+                    ..manifest.clone()
+                },
+                listing: listing.clone(),
             });
             shelf
                 .manifests
@@ -269,18 +282,33 @@ impl<S: PartStore + ?Sized> MemoryCheckpoints<S> {
     }
 }
 
+fn chained(kept: &[Kept]) -> Vec<(u64, u64, Listing)> {
+    let whole = kept
+        .iter()
+        .rposition(|kept| matches!(kept.listing, Listing::Whole(_)))
+        .unwrap_or(0);
+    let mut chain: Vec<(u64, u64, Listing)> = kept
+        .iter()
+        .skip(whole)
+        .map(|kept| (kept.manifest.seq, kept.manifest.epoch, kept.listing.clone()))
+        .collect();
+    chain.sort_by_key(|(seq, _, _)| seq.to_string());
+    chain
+}
+
 impl<S: PartStore + ?Sized> Checkpoints for MemoryCheckpoints<S> {
     fn latest<'a>(
         &'a self,
         scope: &'a str,
     ) -> StoreFuture<'a, Result<Option<Manifest>, StoreError>> {
-        let latest = self.shelf.read(|shelf| {
+        let chain = self.shelf.read(|shelf| {
             shelf
                 .manifests
                 .get(scope)
-                .and_then(|kept| kept.last().cloned())
+                .map(|kept| chained(kept))
+                .unwrap_or_default()
         });
-        Box::pin(async move { Ok(latest) })
+        Box::pin(async move { assemble(scope, chain) })
     }
 
     fn parts<'a>(

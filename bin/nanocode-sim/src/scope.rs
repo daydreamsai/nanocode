@@ -809,6 +809,13 @@ fn send(rng: &mut Rng, world: &World, nodes: &mut [Node], stats: &mut ScopeStats
     let node = &mut nodes[at];
     let sent =
         match driven(world, "a get", node.scopes.get(&scope)).unwrap_or(Err(ScopeError::Busy)) {
+            Err(ScopeError::Store(StoreError::Backend(error))) => {
+                flag(
+                    &world.wrong,
+                    format!("claim: a get of {scope} on {} failed: {error}", node.name),
+                );
+                Err(None)
+            }
             Err(_) => Err(None),
             Ok(Reached::Local(handle)) => {
                 node.handles.insert(scope.clone(), handle.clone());

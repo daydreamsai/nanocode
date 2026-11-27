@@ -29,8 +29,8 @@ const MIGRATIONS: [Migration; 1] = [Migration {
     adopt: None,
 }];
 const LATEST: Dialects = [
-    "SELECT CAST(seq AS TEXT), CAST(epoch AS TEXT), parts FROM nanocode_checkpoint_manifest WHERE scope = ?1 AND seq >= COALESCE((SELECT seq FROM nanocode_checkpoint_manifest WHERE scope = ?1 AND parts LIKE '[%' ORDER BY seq DESC LIMIT 1), 0) ORDER BY seq",
-    "SELECT CAST(seq AS TEXT), CAST(epoch AS TEXT), parts FROM nanocode_checkpoint_manifest WHERE scope = $1::text AND seq >= COALESCE((SELECT seq FROM nanocode_checkpoint_manifest WHERE scope = $1::text AND parts LIKE '[%' ORDER BY seq DESC LIMIT 1), 0) ORDER BY seq",
+    "SELECT CAST(seq AS TEXT), CAST(epoch AS TEXT), parts FROM nanocode_checkpoint_manifest WHERE scope = ?1 AND seq >= COALESCE((SELECT seq FROM nanocode_checkpoint_manifest WHERE scope = ?1 AND parts LIKE '[%' ORDER BY seq DESC LIMIT 1), 0) ORDER BY nanocode_checkpoint_manifest.seq",
+    "SELECT CAST(seq AS TEXT), CAST(epoch AS TEXT), parts FROM nanocode_checkpoint_manifest WHERE scope = $1::text AND seq >= COALESCE((SELECT seq FROM nanocode_checkpoint_manifest WHERE scope = $1::text AND parts LIKE '[%' ORDER BY seq DESC LIMIT 1), 0) ORDER BY nanocode_checkpoint_manifest.seq",
 ];
 const PARTS: Dialects = [
     "SELECT digest, body FROM nanocode_checkpoint_part WHERE digest IN (SELECT value FROM json_each(?1))",
