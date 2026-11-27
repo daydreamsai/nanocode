@@ -260,6 +260,7 @@ default_table='
 1 canary_steer_carry_codex_fact_dropped canary:20 --scenario steer_carry --mutation codex_fact_dropped
 1 canary_steer_carry_gate_dropped canary:8 --scenario steer_carry --mutation carry_gate_dropped
 1 canary_steer_waits_round canary:8 --scenario steer_carry --mutation steer_waits_round
+1 canary_steer_carry_pass_end_skips_steer_read canary:8 --scenario steer_carry --mutation pass_end_skips_steer_read
 4 request_close pass --scenario request_close
 2 request_close_twice pass --scenario request_close --twice
 1 canary_request_close_owned_request_held canary:8 --scenario request_close --mutation owned_request_held

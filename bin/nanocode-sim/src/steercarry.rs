@@ -53,10 +53,11 @@ pub enum CarryMutation {
     CodexFactDropped,
     GateDropped,
     SteerWaitsRound,
+    PassEndSkipsSteerRead,
 }
 
 impl CarryMutation {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::None,
         Self::CarryAsText,
         Self::IgnoresEarlierRead,
@@ -64,6 +65,7 @@ impl CarryMutation {
         Self::CodexFactDropped,
         Self::GateDropped,
         Self::SteerWaitsRound,
+        Self::PassEndSkipsSteerRead,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -81,6 +83,7 @@ impl CarryMutation {
             Self::CodexFactDropped => "codex_fact_dropped",
             Self::GateDropped => "carry_gate_dropped",
             Self::SteerWaitsRound => "steer_waits_round",
+            Self::PassEndSkipsSteerRead => "pass_end_skips_steer_read",
         }
     }
 
@@ -94,7 +97,8 @@ impl CarryMutation {
             | Self::CarryAsText
             | Self::CodexFactDropped
             | Self::GateDropped
-            | Self::SteerWaitsRound => nanocode_durability::sim::Mutation::None,
+            | Self::SteerWaitsRound
+            | Self::PassEndSkipsSteerRead => nanocode_durability::sim::Mutation::None,
         }
     }
 
@@ -102,6 +106,15 @@ impl CarryMutation {
         match self {
             Self::SteerWaitsRound => nanocode::claude::sim::Mutation::SteerWaitsRound,
             _ => nanocode::claude::sim::Mutation::None,
+        }
+    }
+
+    const fn inbox(self) -> nanocode::session_host::inbox_sim::Mutation {
+        match self {
+            Self::PassEndSkipsSteerRead => {
+                nanocode::session_host::inbox_sim::Mutation::PassEndSkipsSteerRead
+            }
+            _ => nanocode::session_host::inbox_sim::Mutation::None,
         }
     }
 
@@ -493,7 +506,8 @@ async fn carry_turn(
         CarryMutation::None
         | CarryMutation::CodexFactDropped
         | CarryMutation::GateDropped
-        | CarryMutation::SteerWaitsRound => {
+        | CarryMutation::SteerWaitsRound
+        | CarryMutation::PassEndSkipsSteerRead => {
             PromptRequest::new("NEXTTURN continue").carry_steer(STEER_ID, Prompt::new(STEER_TEXT))
         }
         CarryMutation::IgnoresEarlierRead | CarryMutation::IgnoresPrunedReceipts => {
@@ -851,6 +865,7 @@ struct Outcome {
 fn simulate(seed: u64, mutation: CarryMutation) -> Outcome {
     nanocode_durability::sim::mutate(mutation.durability());
     nanocode::claude::sim::mutate(mutation.claude());
+    nanocode::session_host::inbox_sim::mutate(mutation.inbox());
     let mut stats = CarryStats {
         seeds: 1,
         ..CarryStats::default()
@@ -906,6 +921,14 @@ fn simulate(seed: u64, mutation: CarryMutation) -> Outcome {
         Ok(calls) => {
             stats.model_calls += calls;
             digest = fnv(digest, format!("steer_order {calls}").as_bytes());
+        }
+        Err(error) => wrong.push(error),
+    }
+    stats.cases += 1;
+    match crate::steerread::check(seed) {
+        Ok((calls, read)) => {
+            stats.model_calls += calls;
+            digest = fnv(digest, format!("steer_read {calls} {read:016x}").as_bytes());
         }
         Err(error) => wrong.push(error),
     }

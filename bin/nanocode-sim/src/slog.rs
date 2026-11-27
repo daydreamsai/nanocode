@@ -304,7 +304,7 @@ struct Stall {
 }
 
 #[derive(Default)]
-struct Store {
+pub(crate) struct Store {
     epoch: AtomicU64,
     claims: AtomicU64,
     refuse: AtomicBool,

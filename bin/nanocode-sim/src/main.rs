@@ -96,6 +96,7 @@ mod socket;
 mod stall;
 mod steercarry;
 mod steerorder;
+mod steerread;
 mod store;
 mod streams;
 mod sync;
