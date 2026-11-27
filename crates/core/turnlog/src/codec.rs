@@ -61,6 +61,7 @@ pub(crate) const SNAPSHOT: char = 's';
 pub(crate) const PART: char = '+';
 pub(crate) const BOUNDARY: char = 'b';
 pub(crate) const LINKED: char = 'P';
+pub(crate) const STAMPED: char = 'w';
 const EMPTY_STORED_BLOCK: [u8; 5] = [0x00, 0x00, 0x00, 0xFF, 0xFF];
 const STANDALONE_BLOCKS_MAX: usize = BASE85_GROUP * BASE64_GROUP;
 const VARINT_BITS: u32 = 7;
@@ -803,7 +804,10 @@ pub(crate) fn padded(text: &str) -> Option<String> {
 }
 
 fn binary(body: &str, whole: bool) -> Option<(&str, String)> {
-    let tag = body.chars().next().filter(char::is_ascii)?;
+    let tag = body
+        .chars()
+        .next()
+        .filter(|tag| tag.is_ascii() && *tag != STAMPED)?;
     let (tag, text) = body.split_at(tag.len_utf8());
     if text.contains(SEGMENT) {
         return whole

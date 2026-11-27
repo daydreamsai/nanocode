@@ -69,6 +69,7 @@ mod network;
 mod onelog;
 mod onelogfacts;
 mod flips;
+mod formats;
 mod partitions;
 mod pgpool;
 mod plog;
@@ -94,6 +95,7 @@ mod streams;
 mod sync;
 mod tasks;
 mod tidy;
+mod tidy_formats;
 mod tidy_switches;
 mod tidy_meter;
 mod turnlog;
@@ -155,6 +157,7 @@ use crate::{
     pgpool::{PgPoolMutation, PgPoolStats},
     admission::{AdmissionMutation, AdmissionStats},
     flips::{FlipsMutation, FlipsStats},
+    formats::{FormatsMutation, FormatsStats},
     plog::{PlogMutation, PlogStats},
     repocache::{RepoCacheMutation, RepoCacheStats},
     requestclose::{RequestCloseMutation, RequestCloseStats},
@@ -248,6 +251,7 @@ enum Scenario {
     PgPool,
     Flips,
     Admission,
+    Formats,
 }
 
 struct Args {
@@ -322,6 +326,7 @@ struct Args {
     pg_pool: PgPoolMutation,
     flips: FlipsMutation,
     admission: AdmissionMutation,
+    formats: FormatsMutation,
     #[cfg(unix)]
     alloc: alloc::AllocMutation,
     #[cfg(unix)]
@@ -336,7 +341,7 @@ type Caught = BTreeMap<Invariant, (u64, u64, (u64, u64))>;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|request_close|steer_carry|antigravity_durable|inbox_stress|capture|executor|dns|board|board_shards|controlplane|cost|plog|secrets|wakes|imports|facts|backend_facts|hand_router|workspace_host|board_sync|dispatcher|board_steer|board_brief|workspace_fs|repo_cache|workspace_sql|git_remote|workspace_stack|workspace_crash|live|partitions|lease|durable|scale|gc_unwind|interp_drop|held_await|holds|slog|append|one_log_facts|migrated|kv_lease|scope|thread_scope|pg_pool|flips|admission] [--ops N] [--twice] [--seed-lines] [--jobs N] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--chain-bytes BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
+        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|request_close|steer_carry|antigravity_durable|inbox_stress|capture|executor|dns|board|board_shards|controlplane|cost|plog|secrets|wakes|imports|facts|backend_facts|hand_router|workspace_host|board_sync|dispatcher|board_steer|board_brief|workspace_fs|repo_cache|workspace_sql|git_remote|workspace_stack|workspace_crash|live|partitions|lease|durable|scale|gc_unwind|interp_drop|held_await|holds|slog|append|one_log_facts|migrated|kv_lease|scope|thread_scope|pg_pool|flips|admission|formats] [--ops N] [--twice] [--seed-lines] [--jobs N] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--chain-bytes BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
        websocket: [--mutation {}]
        http_server: [--mutation {}]
        alloc: [--mutation overstate_size|forget_free|scribble]
@@ -389,7 +394,9 @@ fn usage() -> ExitCode {
        thread_scope: [--mutation {}]
        pg_pool: [--mutation {}]
        flips: [--mutation {}]
-       admission: [--mutation {}]",
+       admission: [--mutation {}]
+       formats: [--mutation {}]
+       --formats-corpus: write the format corpus and formats.txt",
         Mutation::names(),
         TurnMutation::names(),
         onelog::PROTECTIONS.join("|"),
@@ -444,7 +451,8 @@ fn usage() -> ExitCode {
         ThreadScopeMutation::names(),
         PgPoolMutation::names(),
         FlipsMutation::names(),
-        AdmissionMutation::names()
+        AdmissionMutation::names(),
+        FormatsMutation::names()
     );
     ExitCode::from(2)
 }
@@ -549,6 +557,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut pg_pool = PgPoolMutation::None;
     let mut flips = FlipsMutation::None;
     let mut admission = AdmissionMutation::NONE;
+    let mut formats = FormatsMutation::None;
     #[cfg(unix)]
     let mut capture = capture::CaptureMutation::None;
     #[cfg(target_os = "linux")]
@@ -660,6 +669,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
                     "pg_pool" => Scenario::PgPool,
                     "flips" => Scenario::Flips,
                     "admission" => Scenario::Admission,
+                    "formats" => Scenario::Formats,
                     "slog" => Scenario::Slog,
                     "append" => Scenario::Append,
                     "one_log_facts" => Scenario::OneLogFacts,
@@ -769,6 +779,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         (Scenario::PgPool, Some(name)) => pg_pool = PgPoolMutation::parse(name)?,
         (Scenario::Flips, Some(name)) => flips = FlipsMutation::parse(name)?,
         (Scenario::Admission, Some(name)) => admission = AdmissionMutation::parse(name)?,
+        (Scenario::Formats, Some(name)) => formats = FormatsMutation::parse(name)?,
         (Scenario::Slog, Some(name)) => slog = SlogMutation::parse(name)?,
         (Scenario::Append, Some(name)) => append = AppendMutation::parse(name)?,
         (Scenario::OneLogFacts, Some(name)) => {
@@ -870,6 +881,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         pg_pool,
         flips,
         admission,
+        formats,
         #[cfg(unix)]
         alloc,
         #[cfg(unix)]
@@ -1046,6 +1058,9 @@ fn scenario_replay(seed: u64, args: &Args) -> String {
     }
     if args.scenario == Scenario::Admission {
         return admission::replay(seed, args.admission);
+    }
+    if args.scenario == Scenario::Formats {
+        return formats::replay(seed, args.formats);
     }
     if args.scenario == Scenario::Slog {
         return slog::replay(seed, args.slog);
@@ -1460,6 +1475,7 @@ fn mutations() -> ExitCode {
     add("pg_pool", PgPoolMutation::names());
     add("flips", FlipsMutation::names());
     add("admission", AdmissionMutation::names());
+    add("formats", FormatsMutation::names());
     #[cfg(unix)]
     {
         add("alloc", alloc::AllocMutation::names());
@@ -1553,6 +1569,7 @@ struct Totals {
     pg_pool_totals: PgPoolStats,
     flips_totals: FlipsStats,
     admission_totals: AdmissionStats,
+    formats_totals: FormatsStats,
     #[cfg(unix)]
     capture_totals: capture::CaptureStats,
     #[cfg(target_os = "linux")]
@@ -1626,6 +1643,7 @@ impl Totals {
         self.pg_pool_totals.add(&other.pg_pool_totals);
         self.flips_totals.add(&other.flips_totals);
         self.admission_totals.add(&other.admission_totals);
+        self.formats_totals.add(&other.formats_totals);
         #[cfg(unix)]
         self.capture_totals.add(&other.capture_totals);
         #[cfg(target_os = "linux")]
@@ -2019,6 +2037,13 @@ fn judge_one(seed: u64, args: &Args, totals: &mut Totals, caught: &mut Caught) -
             args.options.verbose,
             &mut totals.admission_totals,
         ),
+        Scenario::Formats => formats::judge(
+            seed,
+            args.formats,
+            args.twice,
+            args.options.verbose,
+            &mut totals.formats_totals,
+        ),
         Scenario::Slog => slog::judge(
             seed,
             args.slog,
@@ -2190,6 +2215,9 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("--memory") {
         return memory::main(&args[1..]);
     }
+    if args == ["--formats-corpus"] {
+        return formats::write_corpus();
+    }
     let Some(args) = parse_args(&args) else {
         return usage();
     };
@@ -2266,6 +2294,7 @@ fn main() -> ExitCode {
         || (args.scenario == Scenario::PgPool && args.pg_pool != PgPoolMutation::None)
         || (args.scenario == Scenario::Flips && args.flips != FlipsMutation::None)
         || (args.scenario == Scenario::Admission && args.admission != AdmissionMutation::NONE)
+        || (args.scenario == Scenario::Formats && args.formats != FormatsMutation::None)
         || (args.scenario == Scenario::Slog && args.slog != SlogMutation::None)
         || (args.scenario == Scenario::Append && args.append != AppendMutation::None)
         || (args.scenario == Scenario::OneLogFacts
@@ -2376,6 +2405,7 @@ fn main() -> ExitCode {
         pg_pool_totals,
         flips_totals,
         admission_totals,
+        formats_totals,
         #[cfg(unix)]
         capture_totals,
         #[cfg(target_os = "linux")]
@@ -2895,6 +2925,16 @@ fn main() -> ExitCode {
             args.twice,
             args.admission,
             &admission_totals,
+        );
+    }
+    if args.scenario == Scenario::Formats {
+        return formats::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.formats,
+            &formats_totals,
         );
     }
     if args.scenario == Scenario::Executor {

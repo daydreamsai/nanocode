@@ -4,6 +4,7 @@ mod effect;
 #[cfg(not(target_family = "wasm"))]
 mod file;
 mod fold;
+mod formats;
 mod hold;
 mod host;
 mod image;
@@ -23,6 +24,7 @@ pub use fold::{
     CachedAt, CachedFold, Checkpoint, Event, FOLD_SNAPSHOT_KEY, Fold, OpenCall, Phase, RETIRED_KEY,
     Recovered, Retired, Retry, Segment, Turn, cache_key, input_digest, internal_host, tag,
 };
+pub use formats::{Encoder, Format, FormatError, Formats, Release, Stamp};
 pub use hold::{Answer, Answered, HeldCall, Hold, HoldError, Resumption};
 pub use host::{
     CHECKPOINT_PART_BYTES, Compaction, Extension, LogHost, MemoryLog, MemoryWrites, Rider,

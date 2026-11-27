@@ -28,6 +28,7 @@ use crate::{
         WINDOW,
     },
     fold::{CachedAt, CachedFold, Entry, FOLD_SNAPSHOT_KEY, Page, Section, legacy_name},
+    formats::{self, Stamp},
 };
 
 pub const EVENT_GAP: u64 = 1 << 14;
@@ -93,6 +94,7 @@ pub struct Row {
     pub plain: String,
     pub seq: u64,
     pub snapshot: bool,
+    pub stamp: Option<Stamp>,
 }
 
 impl Row {
@@ -1086,7 +1088,6 @@ pub fn rows(stored: &[(u64, String)]) -> Result<Vec<Row>, StoreError> {
 struct Logical {
     bytes: usize,
     seq: u64,
-    tag: char,
     text: String,
 }
 
@@ -1110,7 +1111,7 @@ fn each_row(
                     )));
                 }
             },
-            Some(tag @ (ARCHIVE | BOUNDARY | LINKED | RECORDS | SECTION | SNAPSHOT)) => {
+            Some(tag) if formats::starts(tag) => {
                 if let Some(logical) = pending.take()
                     && !take(decode_row(logical, history)?)?
                 {
@@ -1119,7 +1120,6 @@ fn each_row(
                 pending = Some(Logical {
                     bytes: body.len(),
                     seq,
-                    tag,
                     text: body,
                 });
             }
@@ -1173,12 +1173,8 @@ fn decoded(tag: char, started: nanocode_platform::Instant, bytes: usize) {
 }
 
 fn decode_row(logical: Logical, history: &mut History) -> Result<Row, StoreError> {
-    let Logical {
-        bytes,
-        seq,
-        tag,
-        text,
-    } = logical;
+    let Logical { bytes, seq, text } = logical;
+    let formats::Opened { stamp, tag, body } = formats::open(seq, &text)?;
     let snapshot = tag == SNAPSHOT;
     let section = tag == SECTION || tag == LINKED;
     let boundary = snapshot || tag == BOUNDARY || tag == ARCHIVE;
@@ -1187,7 +1183,7 @@ fn decode_row(logical: Logical, history: &mut History) -> Result<Row, StoreError
     }
     let decoding = timed().then(nanocode_platform::now);
     let plain = if tag == LINKED {
-        let (back, compressed) = codec::linked(&text[tag.len_utf8()..])?;
+        let (back, compressed) = codec::linked(&text[body..])?;
         let keyframe = seq.checked_sub(back).ok_or_else(|| {
             StoreError::Backend(format!(
                 "turn log row {seq} links back past the log's start"
@@ -1195,9 +1191,9 @@ fn decode_row(logical: Logical, history: &mut History) -> Result<Row, StoreError
         })?;
         history.decode_linked(seq, keyframe, &compressed)?
     } else if section {
-        codec::unpack(&text[tag.len_utf8()..], &[])?
+        codec::unpack(&text[body..], &[])?
     } else {
-        history.decode_records(seq, &text[tag.len_utf8()..])?
+        history.decode_records(seq, &text[body..])?
     };
     if let Some(decoding) = decoding {
         decoded(tag, decoding, plain.len());
@@ -1212,6 +1208,7 @@ fn decode_row(logical: Logical, history: &mut History) -> Result<Row, StoreError
         plain,
         seq,
         snapshot,
+        stamp,
     })
 }
 

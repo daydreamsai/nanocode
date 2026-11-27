@@ -31,6 +31,7 @@ pub enum Mutation {
     ScansUnbatched,
     SnapshotResetsRecovery,
     AbandonRunningJob,
+    WritesUnreleasedFormat,
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);
@@ -41,4 +42,9 @@ pub fn mutate(mutation: Mutation) {
 
 pub fn mutated(mutation: Mutation) -> bool {
     MUTATION.load(Ordering::Relaxed) == mutation as u8
+}
+
+#[must_use]
+pub fn stamped(stamp: crate::Stamp, body: &str) -> String {
+    crate::formats::stamp_row(stamp, body)
 }

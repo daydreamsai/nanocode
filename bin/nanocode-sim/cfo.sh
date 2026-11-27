@@ -433,6 +433,9 @@ default_table='
 1 canary_append_retry_skips_read_back canary:32 --scenario append --mutation retry_skips_read_back
 1 canary_append_conflict_skips_read_back canary:32 --scenario append --mutation conflict_skips_read_back
 1 canary_append_abandon_running_job canary:32 --scenario append --mutation abandon_running_job
+4 formats pass --scenario formats
+1 formats_twice pass --scenario formats --twice
+1 canary_formats_writes_unreleased_format canary:8 --scenario formats --mutation writes_unreleased_format
 8 one_log_facts pass --scenario one_log_facts
 2 one_log_facts_twice pass --scenario one_log_facts --twice
 1 canary_one_log_facts_fold_reads_unlogged canary:8 --scenario one_log_facts --mutation fold_reads_unlogged
