@@ -9,7 +9,7 @@ use std::{
 
 use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_partitions::{Partition, Row};
-use nanocode_sync::{Atom, OrdMap, Slot, Vector, join_in_order, oneshot, watch};
+use nanocode_sync::{Atom, OrdMap, OrdSet, Slot, Vector, oneshot, watch};
 use nanocode_turnlog::{LogHost, SCAN_END, Stamps};
 
 use crate::{
@@ -191,6 +191,7 @@ pub(crate) struct Inner<F: Resident> {
     loads: Flights<Arc<Owner<F>>>,
     claims: Flights<u64>,
     backfills: Atom<OrdMap<Arc<str>, Due>>,
+    running: Atom<OrdSet<Arc<str>>>,
     unreachable: Atom<BTreeSet<String>>,
     tick: AtomicU64,
     pub(crate) stats: Atom<Stats>,
@@ -389,6 +390,7 @@ impl<F: Resident> Scopes<F> {
                 loads: Flights::new(),
                 claims: Flights::new(),
                 backfills: Atom::default(),
+                running: Atom::default(),
                 unreachable: Atom::default(),
                 tick: AtomicU64::new(0),
                 stats: Atom::default(),
@@ -781,36 +783,50 @@ impl<F: Resident> Inner<F> {
     }
 
     async fn backfill(&self) -> Backfilled {
-        let due: Vec<(Arc<str>, Due)> = self.backfills.read(|backfills| {
-            backfills
-                .iter()
-                .map(|(scope, due)| (Arc::clone(scope), *due))
-                .collect()
-        });
-        let lanes = usize::try_from(self.meter.admission().capacity())
-            .expect("a read capacity fits in usize");
-        assert!(lanes > 0, "a backfill runs at least one scope at a time");
+        let mut tried: BTreeSet<Arc<str>> = BTreeSet::new();
         let mut backfilled = Backfilled::default();
-        for batch in due.chunks(lanes) {
-            let ran = join_in_order(
-                batch
-                    .iter()
-                    .map(|(scope, due)| self.backfill_one(scope, *due)),
-            )
-            .await;
-            for ((scope, _), outcome) in batch.iter().zip(ran) {
-                match outcome {
-                    Ok(Backfill::Adopted) => backfilled.adopted += 1,
-                    Ok(Backfill::Current) => backfilled.current += 1,
-                    Ok(Backfill::Dropped) => backfilled.dropped += 1,
-                    Err(error) => backfilled.failed.push((scope.as_ref().to_owned(), error)),
-                }
+        while let Some((scope, due)) = self.claim_due(&tried) {
+            let outcome = self.backfill_one(&scope, due).await;
+            self.running.update(|running| {
+                running.remove(&scope);
+            });
+            match outcome {
+                Ok(Backfill::Adopted) => backfilled.adopted += 1,
+                Ok(Backfill::Current) => backfilled.current += 1,
+                Ok(Backfill::Dropped) => backfilled.dropped += 1,
+                Err(error) => backfilled.failed.push((scope.as_ref().to_owned(), error)),
             }
+            tried.insert(scope);
         }
         let failures = backfilled.failed.len() as u64;
         self.stats
             .update(|stats| stats.backfill_failures += failures);
         backfilled
+    }
+
+    fn claim_due(&self, tried: &BTreeSet<Arc<str>>) -> Option<(Arc<str>, Due)> {
+        let capacity = usize::try_from(self.meter.admission().capacity())
+            .expect("a read capacity fits in usize");
+        let due: Vec<(Arc<str>, Due)> = self.backfills.read(|backfills| {
+            backfills
+                .iter()
+                .filter(|(scope, _)| !tried.contains(*scope))
+                .map(|(scope, due)| (Arc::clone(scope), *due))
+                .collect()
+        });
+        let claimed = self.running.update(|running| {
+            if running.len() >= capacity {
+                return None;
+            }
+            let next = due.iter().find(|(scope, _)| !running.contains(scope))?;
+            running.insert(Arc::clone(&next.0));
+            Some(next.clone())
+        });
+        assert!(
+            self.running.read(OrdSet::len) <= capacity,
+            "at most the read capacity of backfills run at once"
+        );
+        claimed
     }
 
     async fn backfill_one(&self, scope: &Arc<str>, due: Due) -> Result<Backfill, ScopeError> {

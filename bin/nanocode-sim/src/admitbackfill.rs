@@ -11,7 +11,7 @@ use std::{
 
 use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_scope::{
-    Adopted, Checkpoints, Committed, MemoryCheckpoints, Part, PartedLeases, Policy, Reached,
+    Adopted, Backfilled, Checkpoints, Committed, MemoryCheckpoints, Part, PartedLeases, Policy, Reached,
     Resident, Route, ScopeError, Scopes, Wiring,
 };
 use nanocode_sync::{Atom, block_on};
@@ -337,14 +337,17 @@ fn queued(world: &World, rng: &mut Rng) -> Vec<String> {
 
 fn raced(world: &World, rng: &mut Rng, stats: &mut BackfillStats) -> Vec<String> {
     let served: Atom<Vec<(String, u64, Result<(), String>)>> = Atom::default();
-    let backfilled = Atom::new(None);
-    let mut tasks: Vec<Task<'_>> = Vec::with_capacity(world.plain.len() + 1);
+    let backfilled: Atom<Vec<Backfilled>> = Atom::default();
+    let lanes = usize::try_from(world.capacity).expect("a capacity fits in usize");
+    let mut tasks: Vec<Task<'_>> = Vec::with_capacity(world.plain.len() + lanes);
     let (scopes, clock) = (&world.scopes, &world.clock);
-    let backfilled_ref = &backfilled;
-    tasks.push(Box::pin(async move {
-        let done = scopes.backfill().await;
-        backfilled_ref.update(|backfilled| *backfilled = Some(done.clone()));
-    }));
+    for _ in 0..lanes {
+        let backfilled = &backfilled;
+        tasks.push(Box::pin(async move {
+            let done = scopes.backfill().await;
+            backfilled.update(|backfilled| backfilled.push(done.clone()));
+        }));
+    }
     for name in &world.plain {
         let served = &served;
         tasks.push(Box::pin(async move {
@@ -373,21 +376,20 @@ fn raced(world: &World, rng: &mut Rng, stats: &mut BackfillStats) -> Vec<String>
             ));
         }
     }
-    match backfilled.read(Clone::clone) {
-        Some(done) => {
-            stats.adopted += done.adopted;
-            if let Some((scope, error)) = done.failed.first() {
-                wrong.push(format!("backfill: the backfill of {scope} failed: {error}"));
-            }
-            if done.adopted != world.old.len() as u64 {
-                wrong.push(format!(
-                    "backfill: a backfill adopted {} of {} queued scopes",
-                    done.adopted,
-                    world.old.len()
-                ));
-            }
-        }
-        None => wrong.push("backfill: the backfill never answered".to_owned()),
+    let done = backfilled.read(Clone::clone);
+    if done.len() != lanes {
+        wrong.push(format!("backfill: {} of {lanes} backfill calls answered", done.len()));
+    }
+    let adopted: u64 = done.iter().map(|done| done.adopted).sum();
+    stats.adopted += adopted;
+    if let Some((scope, error)) = done.iter().flat_map(|done| &done.failed).next() {
+        wrong.push(format!("backfill: the backfill of {scope} failed: {error}"));
+    }
+    if adopted != world.old.len() as u64 {
+        wrong.push(format!(
+            "backfill: {lanes} backfill calls adopted {adopted} of {} queued scopes",
+            world.old.len()
+        ));
     }
     wrong
 }
