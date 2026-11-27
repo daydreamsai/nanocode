@@ -25,7 +25,7 @@ use crate::{
     executor::Clock,
     rng::{FNV_OFFSET, Rng, fnv},
     threadcompat, threadlegacy,
-    threadscope::{Node, PARTS, World, driven, flag, publish, raw},
+    threadscope::{Node, PARTS, World, driven, flag, publish, raw, reach},
     threadsessions::{self, Sessions},
 };
 
@@ -466,7 +466,7 @@ fn agree(
     let state = decoded(world)?;
     threadcompat::resident(world, THREAD, &host, &state, &run.ids, when)?;
     if run.over.path() == ThreadPath::Resident {
-        let log = match driven(world, "a flips get", run.node.logs.get(THREAD))? {
+        let log = match reach(world, &run.node, THREAD)? {
             Ok(log) => log,
             Err(error) => {
                 flag(
@@ -569,7 +569,7 @@ const fn row_format(stamped: bool) -> Format {
 }
 
 fn missed(world: &World, node: &Node) -> Option<()> {
-    let log = match driven(world, "a flips get", node.logs.get(THREAD))? {
+    let log = match reach(world, node, THREAD)? {
         Ok(log) => log,
         Err(error) => {
             flag(
@@ -660,6 +660,13 @@ fn round(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) ->
         return None;
     }
     if run.over.path() != to {
+        driven(world, "a flips backfill", run.node.logs.scopes().backfill())?;
+        if let Err(error) = driven(world, "a flips read after its backfill", run.over.pending())? {
+            failed(world, run, "the read after a backfill", &error);
+            return None;
+        }
+    }
+    if run.over.path() != to {
         flag(
             &world.wrong,
             format!(
@@ -685,7 +692,7 @@ fn sessions(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats)
         return Some(());
     };
     if run.over.path() == ThreadPath::Resident
-        && let Some(Ok(log)) = driven(world, "a flips get", run.node.logs.get(THREAD))
+        && let Some(Ok(log)) = reach(world, &run.node, THREAD)
         && let Some(state) = log.state()
         && let Err(error) = threadsessions::held(&state, THREAD, &sessions)
     {

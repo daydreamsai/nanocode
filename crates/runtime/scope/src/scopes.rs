@@ -9,7 +9,7 @@ use std::{
 
 use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_partitions::{Partition, Row};
-use nanocode_sync::{Atom, OrdMap, Slot, Vector, oneshot, watch};
+use nanocode_sync::{Atom, OrdMap, Slot, Vector, join_in_order, oneshot, watch};
 use nanocode_turnlog::{LogHost, SCAN_END, Stamps};
 
 use crate::{
@@ -59,6 +59,29 @@ pub struct Stats {
     pub admissions: u64,
     pub admissions_busy: u64,
     pub release_drops: u64,
+    pub unadopted: u64,
+    pub backfill_reads: u64,
+    pub backfill_failures: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Backfilled {
+    pub adopted: u64,
+    pub current: u64,
+    pub dropped: u64,
+    pub failed: Vec<(String, ScopeError)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Due {
+    part: Partition,
+    epoch: u64,
+}
+
+enum Backfill {
+    Adopted,
+    Current,
+    Dropped,
 }
 
 pub struct Wiring<F: Resident> {
@@ -167,6 +190,7 @@ pub(crate) struct Inner<F: Resident> {
     residents: Atom<OrdMap<Arc<str>, Arc<Owner<F>>>>,
     loads: Flights<Arc<Owner<F>>>,
     claims: Flights<u64>,
+    backfills: Atom<OrdMap<Arc<str>, Due>>,
     unreachable: Atom<BTreeSet<String>>,
     tick: AtomicU64,
     pub(crate) stats: Atom<Stats>,
@@ -364,6 +388,7 @@ impl<F: Resident> Scopes<F> {
                 residents: Atom::default(),
                 loads: Flights::new(),
                 claims: Flights::new(),
+                backfills: Atom::default(),
                 unreachable: Atom::default(),
                 tick: AtomicU64::new(0),
                 stats: Atom::default(),
@@ -456,6 +481,7 @@ impl<F: Resident> Scopes<F> {
             usage: self.inner.meter.usage(),
             admissions: admitted.admissions,
             admissions_busy: admitted.busy,
+            backfill_reads: admitted.backfill_reads,
             ..self.inner.stats.read(|stats| *stats)
         }
     }
@@ -470,6 +496,16 @@ impl<F: Resident> Scopes<F> {
 
     pub fn read_capacity(&self) -> u32 {
         self.inner.meter.admission().capacity()
+    }
+
+    pub fn adopting(&self, scope: &str) -> bool {
+        self.inner
+            .backfills
+            .read(|backfills| backfills.contains_key(scope))
+    }
+
+    pub async fn backfill(&self) -> Backfilled {
+        self.inner.backfill().await
     }
 }
 
@@ -522,7 +558,21 @@ impl<F: Resident> Inner<F> {
             owner.lose();
             self.evicted(owner);
         }
+        self.unqueue(part);
         self.stats.update(|stats| stats.lost += lost.len() as u64);
+    }
+
+    fn unqueue(&self, part: Partition) {
+        self.backfills.update(|backfills| {
+            let dropped: Vec<Arc<str>> = backfills
+                .iter()
+                .filter(|(_, due)| due.part == part)
+                .map(|(scope, _)| Arc::clone(scope))
+                .collect();
+            for scope in &dropped {
+                backfills.remove(scope);
+            }
+        });
     }
 
     async fn get(self: &Arc<Self>, scope: &str) -> Result<Reached<F>, ScopeError> {
@@ -544,6 +594,10 @@ impl<F: Resident> Inner<F> {
                 }
             },
         };
+        if self.due(scope, epoch) {
+            self.stats.update(|stats| stats.unadopted += 1);
+            return Err(ScopeError::Unadopted);
+        }
         let owner = if sim::mutated(Mutation::ColdLoadDuplicated) {
             self.load(scope, part, epoch).await?
         } else {
@@ -620,7 +674,12 @@ impl<F: Resident> Inner<F> {
         }
         let name: Arc<str> = Arc::from(scope);
         let tally = self.meter.enter(&name);
-        let owner = match self.meter.admission().admitted(self.read(scope)).await {
+        let owner = match self
+            .meter
+            .admission()
+            .admitted(self.read(scope, Due { part, epoch }))
+            .await
+        {
             Ok(loaded) => {
                 let placed = Placed {
                     part,
@@ -637,7 +696,7 @@ impl<F: Resident> Inner<F> {
         owner
     }
 
-    async fn read(&self, scope: &str) -> Result<Loaded<F::State>, ScopeError> {
+    async fn read(&self, scope: &str, due: Due) -> Result<Loaded<F::State>, ScopeError> {
         let manifest = if sim::mutated(Mutation::CheckpointIndexesOnly) {
             None
         } else {
@@ -657,11 +716,152 @@ impl<F: Resident> Inner<F> {
                         tail,
                         adopted: None,
                     }),
-                    Some((seq, _)) => self.adopted(scope, now, Some(*seq)).await,
+                    Some((seq, _)) => self.unadopted(scope, due, now, Some(*seq)).await,
                 }
             }
-            None => self.adopted(scope, now, None).await,
+            None => self.unadopted(scope, due, now, None).await,
         }
+    }
+
+    fn due(&self, scope: &str, epoch: u64) -> bool {
+        self.backfills
+            .read(|backfills| backfills.get(scope).is_some_and(|due| due.epoch == epoch))
+    }
+
+    fn queue(&self, scope: &str, due: Due) -> ScopeError {
+        self.backfills
+            .update(|backfills| backfills.insert(Arc::from(scope), due));
+        self.stats.update(|stats| stats.unadopted += 1);
+        ScopeError::Unadopted
+    }
+
+    fn undue(&self, scope: &str, due: Due) {
+        self.backfills.update(|backfills| {
+            if backfills.get(scope) == Some(&due) {
+                backfills.remove(scope);
+            }
+        });
+    }
+
+    async fn unadopted(
+        &self,
+        scope: &str,
+        due: Due,
+        now: u64,
+        foreign: Option<u64>,
+    ) -> Result<Loaded<F::State>, ScopeError> {
+        if sim::mutated(Mutation::AdoptInRequest) {
+            if let Some(loaded) = self.adoption(scope, now, foreign).await? {
+                return Ok(loaded);
+            }
+            return self.fresh(scope, now).await;
+        }
+        if foreign.is_some() || self.fold.adoption(&self.logs.load, scope).await? {
+            return Err(self.queue(scope, due));
+        }
+        self.fresh(scope, now).await
+    }
+
+    async fn fresh(&self, scope: &str, now: u64) -> Result<Loaded<F::State>, ScopeError> {
+        let next = self.fold.first_row();
+        let tail = self.logs.load.scan(scope, next, SCAN_END).await?;
+        if let Some((seq, _)) = tail.iter().find(|(_, row)| self.fold.foreign(row)) {
+            return Err(ScopeError::Store(StoreError::Backend(format!(
+                "row {seq} of {scope} was written outside the scope, and its fold found nothing to adopt"
+            ))));
+        }
+        Ok(Loaded {
+            state: self.fold.empty(),
+            next,
+            checkpointed: Checkpointed::empty(now),
+            parts: 0,
+            tail,
+            adopted: None,
+        })
+    }
+
+    async fn backfill(&self) -> Backfilled {
+        let due: Vec<(Arc<str>, Due)> = self.backfills.read(|backfills| {
+            backfills
+                .iter()
+                .map(|(scope, due)| (Arc::clone(scope), *due))
+                .collect()
+        });
+        let lanes = usize::try_from(self.meter.admission().capacity())
+            .expect("a read capacity fits in usize");
+        assert!(lanes > 0, "a backfill runs at least one scope at a time");
+        let mut backfilled = Backfilled::default();
+        for batch in due.chunks(lanes) {
+            let ran = join_in_order(
+                batch
+                    .iter()
+                    .map(|(scope, due)| self.backfill_one(scope, *due)),
+            )
+            .await;
+            for ((scope, _), outcome) in batch.iter().zip(ran) {
+                match outcome {
+                    Ok(Backfill::Adopted) => backfilled.adopted += 1,
+                    Ok(Backfill::Current) => backfilled.current += 1,
+                    Ok(Backfill::Dropped) => backfilled.dropped += 1,
+                    Err(error) => backfilled.failed.push((scope.as_ref().to_owned(), error)),
+                }
+            }
+        }
+        let failures = backfilled.failed.len() as u64;
+        self.stats
+            .update(|stats| stats.backfill_failures += failures);
+        backfilled
+    }
+
+    async fn backfill_one(&self, scope: &Arc<str>, due: Due) -> Result<Backfill, ScopeError> {
+        if self.leases.held(due.part) != Some(due.epoch) {
+            self.undue(scope, due);
+            return Ok(Backfill::Dropped);
+        }
+        let tally = self.meter.enter(scope);
+        let admission = self.meter.admission();
+        let loaded = if sim::mutated(Mutation::BackfillTakesServingLanes) {
+            admission.admitted(self.backfilled(scope)).await
+        } else {
+            self.backfilled(scope).await
+        };
+        let placed = Placed {
+            part: due.part,
+            epoch: due.epoch,
+            tally: Arc::clone(&tally),
+        };
+        let landed = match loaded {
+            Ok(Some(loaded)) if self.leases.held(due.part) == Some(due.epoch) => self
+                .resident_from(Arc::clone(scope), placed, loaded)
+                .await
+                .map(|_| Backfill::Adopted),
+            Ok(Some(_)) => Ok(Backfill::Dropped),
+            Ok(None) => Ok(Backfill::Current),
+            Err(error) => Err(error),
+        };
+        if !matches!(landed, Ok(Backfill::Adopted)) {
+            self.meter.leave(scope, &tally);
+        }
+        if landed.is_ok() {
+            self.undue(scope, due);
+        }
+        landed
+    }
+
+    async fn backfilled(&self, scope: &str) -> Result<Option<Loaded<F::State>>, ScopeError> {
+        let admission = self.meter.admission();
+        let now = (self.clock)();
+        let foreign = match admission.backfilled(self.meter.latest(scope)).await? {
+            Some(manifest) => {
+                let tail = self.logs.adopt.scan(scope, manifest.seq, SCAN_END).await?;
+                match tail.iter().find(|(_, row)| self.fold.foreign(row)) {
+                    None => return Ok(None),
+                    Some((seq, _)) => Some(*seq),
+                }
+            }
+            None => None,
+        };
+        self.adoption(scope, now, foreign).await
     }
 
     async fn resident_from(
@@ -719,42 +919,39 @@ impl<F: Resident> Inner<F> {
         Ok(owner)
     }
 
-    async fn adopted(
+    async fn adoption(
         &self,
         scope: &str,
         now: u64,
         foreign: Option<u64>,
-    ) -> Result<Loaded<F::State>, ScopeError> {
-        let fresh = Checkpointed::empty(now);
-        let (state, next, adopted) = match (self.fold.adopt(&self.logs.adopt, scope).await?, foreign) {
-            (None, None) => (self.fold.empty(), self.fold.first_row(), None),
+    ) -> Result<Option<Loaded<F::State>>, ScopeError> {
+        let Adopted {
+            state,
+            next,
+            rows,
+            bytes,
+        } = match (self.fold.adopt(&self.logs.adopt, scope).await?, foreign) {
+            (None, None) => return Ok(None),
             (None, Some(seq)) => {
                 return Err(ScopeError::Store(StoreError::Backend(format!(
                     "row {seq} of {scope} past its checkpoint was written outside the scope, and its log adopts nothing"
                 ))));
             }
-            (
-                Some(Adopted {
-                    state,
-                    next,
-                    rows,
-                    bytes,
-                }),
-                _,
-            ) => {
-                assert!(next > 0, "an adopted history of {scope} ends past row 0");
-                (state, next, Some((rows, bytes)))
-            }
+            (Some(adopted), _) => adopted,
         };
-        let tail = self.logs.load.scan(scope, next, SCAN_END).await?;
-        Ok(Loaded {
+        assert!(next > 0, "an adopted history of {scope} ends past row 0");
+        let tail = self.logs.adopt.scan(scope, next, SCAN_END).await?;
+        if tail.iter().any(|(_, row)| self.fold.foreign(row)) {
+            return Err(ScopeError::Unadopted);
+        }
+        Ok(Some(Loaded {
             state,
             next,
-            checkpointed: fresh,
+            checkpointed: Checkpointed::empty(now),
             parts: 0,
             tail,
-            adopted,
-        })
+            adopted: Some((rows, bytes)),
+        }))
     }
 
     async fn restore(
@@ -845,6 +1042,7 @@ impl<F: Resident> Inner<F> {
                 Err(_) => dropped += 1,
             }
         }
+        self.unqueue(part);
         self.leases.release(part).await?;
         self.stats.update(|stats| {
             stats.releases += 1;

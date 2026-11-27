@@ -404,6 +404,11 @@ pub(super) async fn legacy_facts(
         .collect()
 }
 
+pub(super) async fn due(log: &Arc<dyn LogHost>, scope: &str) -> Result<bool, StoreError> {
+    let loaded = log.load(scope).await?;
+    Ok(!loaded.is_empty() && !plain(&loaded))
+}
+
 pub(super) async fn adopt(
     log: &Arc<dyn LogHost>,
     scope: &str,

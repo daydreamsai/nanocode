@@ -84,9 +84,10 @@ const COMPAT_RECENT_ROWS: usize = 1 << 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThreadScopeMutation(Mutation, ScopeMutation, TurnLogMutation);
 
-const SCOPE_MUTATIONS: [ScopeMutation; 2] = [
+const SCOPE_MUTATIONS: [ScopeMutation; 3] = [
     ScopeMutation::ListingSkipsDropped,
     ScopeMutation::AdoptionSkipsCheckpoint,
+    ScopeMutation::AdoptInRequest,
 ];
 
 const TURN_LOG_MUTATIONS: [(&str, TurnLogMutation); 1] = [(
@@ -465,6 +466,27 @@ pub(crate) fn driven<T>(world: &World, what: &str, future: impl Future<Output = 
         );
     }
     driven
+}
+
+pub(crate) fn reach(world: &World, node: &Node, thread: &str) -> Option<Result<ThreadLog, ScopeError>> {
+    let scopes = node.logs.scopes();
+    let before = scopes.stats().usage.adopt.calls;
+    let reached = driven(world, "a get", node.logs.get(thread))?;
+    let read = scopes.stats().usage.adopt.calls - before;
+    if read > 0 {
+        flag(
+            &world.wrong,
+            format!("I8: a get of {thread} on {} made {read} adoption reads; only a backfill adopts", node.name),
+        );
+    }
+    if !matches!(reached, Err(ScopeError::Unadopted)) {
+        return Some(reached);
+    }
+    let backfilled = driven(world, "a backfill", scopes.backfill())?;
+    if let Some((scope, error)) = backfilled.failed.first() {
+        flag(&world.wrong, format!("the backfill of {scope} on {} failed: {error}", node.name));
+    }
+    driven(world, "a get after its backfill", node.logs.get(thread))
 }
 
 pub(crate) fn raw(value: &serde_json::Value) -> Box<RawValue> {
@@ -857,7 +879,7 @@ fn send(
 ) -> Option<usize> {
     let at = rng.pick(nodes.len());
     let thread = world.threads[rng.pick(world.threads.len())].clone();
-    let reached = driven(world, "a get", nodes[at].logs.get(&thread))?;
+    let reached = reach(world, &nodes[at], &thread)?;
     let Ok(log) = reached else {
         stats.refused += 1;
         return None;

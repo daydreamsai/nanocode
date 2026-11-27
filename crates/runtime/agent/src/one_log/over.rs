@@ -65,6 +65,18 @@ struct Old {
     log: Arc<OneLog>,
     resident: Option<Arc<Bound>>,
     uncertain: Vec<String>,
+    adopting: bool,
+}
+
+impl Old {
+    fn adopting(&self, adopting: bool) -> Self {
+        Self {
+            log: Arc::clone(&self.log),
+            resident: self.resident.clone(),
+            uncertain: self.uncertain.clone(),
+            adopting,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -205,6 +217,24 @@ async fn held(logs: &ThreadLogs, thread: &str) -> Result<(), StoreError> {
     unclaimed(logs, thread).await
 }
 
+async fn unadopted(
+    logs: &ThreadLogs,
+    thread: &str,
+    policy: &Policy,
+    effects: &Arc<Atom<Effects>>,
+    adopting: bool,
+) -> Result<Old, StoreError> {
+    held(logs, thread).await?;
+    let log = legacy::writer(logs, thread, policy, effects).await?;
+    let uncertain = log.uncertain_holds().await;
+    Ok(Old {
+        log,
+        resident: None,
+        uncertain,
+        adopting,
+    })
+}
+
 impl OneLog {
     pub async fn over(
         logs: Arc<ThreadLogs>,
@@ -216,19 +246,21 @@ impl OneLog {
             if sim::mutated(sim::Mutation::LegacyOpenClaims) {
                 drop(logs.reach(thread).await.map_err(refused)?);
             }
-            held(&logs, thread).await?;
-            let log = legacy::writer(&logs, thread, policy, &effects).await?;
-            let uncertain = log.uncertain_holds().await;
-            let old = Old {
-                log,
-                resident: None,
-                uncertain,
-            };
+            let old = unadopted(&logs, thread, policy, &effects, false).await?;
             (None, Serving::Legacy(Arc::new(old)))
         } else {
-            let log = Arc::new(logs.reach(thread).await.map_err(refused)?);
-            let bound = bound(Arc::clone(&log), thread, policy, &effects)?;
-            (Some(log), Serving::Resident(Arc::new(bound)))
+            match logs.reach(thread).await {
+                Ok(log) => {
+                    let log = Arc::new(log);
+                    let bound = bound(Arc::clone(&log), thread, policy, &effects)?;
+                    (Some(log), Serving::Resident(Arc::new(bound)))
+                }
+                Err(ScopeError::Unadopted) => {
+                    let old = unadopted(&logs, thread, policy, &effects, true).await?;
+                    (None, Serving::Legacy(Arc::new(old)))
+                }
+                Err(error) => return Err(refused(error)),
+            }
         };
         let binding = Arc::new(ThreadBinding::new(Arc::clone(&logs), thread, log));
         let store = ThreadStore::rebinding(Arc::clone(&binding));
@@ -320,7 +352,15 @@ impl OneLogOver {
             .await?;
         }
         let serving = self.current();
-        let fresh = match (&serving, self.logs.path(&self.thread)) {
+        let path = self.logs.path(&self.thread);
+        let flipped = match &serving {
+            Serving::Legacy(old) if old.adopting => path == ThreadPath::Legacy,
+            serving => serving.path() != path,
+        };
+        let fresh = match (&serving, path) {
+            (Serving::Legacy(old), ThreadPath::Legacy) if old.adopting => {
+                Serving::Legacy(Arc::new(old.adopting(false)))
+            }
             (Serving::Legacy(_), ThreadPath::Legacy) => return Ok(serving),
             (Serving::Resident(bound), ThreadPath::Resident) => match self.binding.log() {
                 Some(log) if Arc::ptr_eq(&bound.log, &log) => return Ok(serving),
@@ -330,11 +370,17 @@ impl OneLogOver {
             (Serving::Resident(bound), ThreadPath::Legacy) => {
                 Serving::Legacy(self.old(Some(bound)).await?)
             }
-            (Serving::Legacy(old), ThreadPath::Resident) => {
-                Serving::Resident(self.adopted(old).await?)
+            (Serving::Legacy(old), ThreadPath::Resident)
+                if old.adopting && self.logs.scopes().adopting(&self.thread) =>
+            {
+                return Ok(serving);
             }
+            (Serving::Legacy(old), ThreadPath::Resident) => match self.adopted(old).await? {
+                Some(bound) => Serving::Resident(bound),
+                None => Serving::Legacy(Arc::new(old.adopting(true))),
+            },
         };
-        if fresh.path() != serving.path() {
+        if flipped {
             self.logs.flipped();
         }
         Ok(self.settled(&serving, fresh))
@@ -374,30 +420,31 @@ impl OneLogOver {
             log,
             resident: resident.cloned(),
             uncertain,
+            adopting: false,
         }))
     }
 
-    async fn adopted(&self, old: &Old) -> Result<Arc<Bound>, StoreError> {
+    async fn adopted(&self, old: &Old) -> Result<Option<Arc<Bound>>, StoreError> {
         handed_over(&old.log).await?;
         let stale = old.resident.as_ref().map(|bound| &bound.log);
         let log = match self.binding.log() {
             Some(log) if !log.retired() && !stale.is_some_and(|stale| Arc::ptr_eq(&log, stale)) => {
                 log
             }
-            current => self
-                .binding
-                .rebound(current.as_ref())
-                .await
-                .map_err(refused)?,
+            current => match self.binding.rebound(current.as_ref()).await {
+                Ok(log) => log,
+                Err(ScopeError::Unadopted) => return Ok(None),
+                Err(error) => return Err(refused(error)),
+            },
         };
         let Some(resident) = &old.resident else {
             let bound = Arc::new(bound(log, &self.thread, &self.policy, &self.effects)?);
             if let Some(index) = self.index.read(Clone::clone) {
                 bound.wakes.index_wakes(index).await?;
             }
-            return Ok(bound);
+            return Ok(Some(bound));
         };
-        self.bind(resident, log).await
+        self.bind(resident, log).await.map(Some)
     }
 
     async fn again(&self, stale: &Serving) -> Result<Serving, StoreError> {

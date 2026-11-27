@@ -24,6 +24,8 @@ pub enum Mutation {
     RoutesPastExpiry,
     LegacyAdmittedIdle,
     ChainInStoreOrder,
+    AdoptInRequest,
+    BackfillTakesServingLanes,
     ReleaseStopsAtDrain,
 }
 
@@ -48,11 +50,12 @@ impl Mutation {
         Self::ReleaseStopsAtDrain,
     ];
 
-    pub const ADMISSION: [Self; 4] = [
+    pub const ADMISSION: [Self; 5] = [
         Self::AdmissionUnbounded,
         Self::ColdLoadDuplicated,
         Self::MeterSkipsWriterTask,
         Self::LegacyAdmittedIdle,
+        Self::BackfillTakesServingLanes,
     ];
 
     #[must_use]
@@ -79,6 +82,8 @@ impl Mutation {
             Self::RoutesPastExpiry => "routes_past_expiry",
             Self::LegacyAdmittedIdle => "legacy_admitted_idle",
             Self::ChainInStoreOrder => "chain_in_store_order",
+            Self::AdoptInRequest => "adopt_in_request",
+            Self::BackfillTakesServingLanes => "backfill_takes_serving_lanes",
             Self::ReleaseStopsAtDrain => "release_stops_at_drain",
         }
     }

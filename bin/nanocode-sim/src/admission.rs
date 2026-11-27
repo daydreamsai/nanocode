@@ -24,6 +24,7 @@ use nanocode_turnlog::{
 };
 
 use crate::{
+    admitbackfill::{self, BackfillStats},
     admitturns::{self, TurnStats},
     executor::{Clock, Ended, Executor, Task},
     rng::{FNV_OFFSET, Rng, fnv},
@@ -109,6 +110,7 @@ pub struct AdmissionStats {
     pub history_reads: u64,
     pub history_busy: u64,
     pub turns: TurnStats,
+    pub backfill: BackfillStats,
 }
 
 impl AdmissionStats {
@@ -122,6 +124,7 @@ impl AdmissionStats {
         self.history_reads += other.history_reads;
         self.history_busy += other.history_busy;
         self.turns.add(&other.turns);
+        self.backfill.add(&other.backfill);
     }
 }
 
@@ -614,6 +617,9 @@ fn seeded(seed: u64, clock: &Arc<Clock>) -> Outcome {
     world
         .wrong
         .extend(admitturns::run(&mut rng, clock, &mut stats.turns));
+    world
+        .wrong
+        .extend(admitbackfill::run(&mut rng, clock, &mut stats.backfill));
     let shape = format!(
         "capacity={} scopes={} gets={} loaded={}",
         world.capacity,

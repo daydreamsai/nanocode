@@ -7,7 +7,7 @@ use nanocode_turnlog::LogHost;
 
 use crate::rng::Rng;
 use crate::threadlegacy::{self, Legacy};
-use crate::threadscope::{PARTS, ThreadScopeStats, World, command, driven, flag, publish};
+use crate::threadscope::{PARTS, ThreadScopeStats, World, command, driven, flag, publish, reach};
 
 const THREAD: &str = "compat";
 const COMMANDS: Range<u64> = 12..40;
@@ -91,7 +91,7 @@ fn stint(
 ) -> Option<u64> {
     let node = world.node(name);
     publish(world, std::slice::from_ref(&node));
-    let log = match driven(world, "a compat claim", node.logs.get(THREAD))? {
+    let log = match reach(world, &node, THREAD)? {
         Ok(log) => log,
         Err(error) => {
             flag(

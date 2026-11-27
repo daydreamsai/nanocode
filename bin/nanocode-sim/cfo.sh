@@ -491,6 +491,7 @@ default_table='
 1 canary_admission_meter_skips_writer_task canary:8 --scenario admission --mutation meter_skips_writer_task
 1 canary_admission_admission_busy_fatal canary:8 --scenario admission --mutation admission_busy_fatal
 1 canary_admission_legacy_admitted_idle canary:8 --scenario admission --mutation legacy_admitted_idle
+1 canary_admission_backfill_takes_serving_lanes canary:8 --scenario admission --mutation backfill_takes_serving_lanes
 4 thread_scope pass --scenario thread_scope
 1 thread_scope_twice pass --scenario thread_scope --twice
 1 canary_thread_scope_part_dropped canary:16 --scenario thread_scope --mutation part_dropped
@@ -524,6 +525,7 @@ default_table='
 1 canary_thread_scope_journal_loads_finished canary:16 --scenario thread_scope --mutation journal_loads_finished
 1 canary_thread_scope_tail_unbounded canary:16 --scenario thread_scope --mutation tail_unbounded
 1 canary_thread_scope_open_per_request canary:16 --scenario thread_scope --mutation open_per_request
+1 canary_thread_scope_adopt_in_request canary:16 --scenario thread_scope --mutation adopt_in_request
 4 flips pass --scenario flips
 1 flips_twice pass --scenario flips --twice
 1 canary_flips_flip_off_unreadable canary:16 --scenario flips --mutation flip_off_unreadable

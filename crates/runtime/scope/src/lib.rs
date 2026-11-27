@@ -20,7 +20,7 @@ pub use checkpoint::{
 pub use lease::{Leases, PartedLeases};
 pub use meter::{Usage, Work};
 pub use route::Route;
-pub use scopes::{ClaimHook, Clock, Reached, Routed, Scope, Scopes, Stats, Wiring};
+pub use scopes::{Backfilled, ClaimHook, Clock, Reached, Routed, Scope, Scopes, Stats, Wiring};
 pub use sql::SqlCheckpoints;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +97,14 @@ pub trait Resident: Send + Sync + 'static {
         true
     }
 
+    fn adoption<'a>(
+        &'a self,
+        _log: &'a Arc<dyn LogHost>,
+        _scope: &'a str,
+    ) -> StoreFuture<'a, Result<bool, StoreError>> {
+        Box::pin(std::future::ready(Ok(false)))
+    }
+
     fn adopt<'a>(
         &'a self,
         _log: &'a Arc<dyn LogHost>,
@@ -118,6 +126,7 @@ pub enum ScopeError {
     Moved,
     Lost,
     Uncertain,
+    Unadopted,
     Bound {
         bound: &'static str,
         limit: usize,
@@ -147,6 +156,9 @@ impl std::fmt::Display for ScopeError {
             }
             Self::Uncertain => formatter
                 .write_str("the command's append ended without an answer; it may have landed"),
+            Self::Unadopted => formatter.write_str(
+                "the scope's log holds rows an older writer wrote past its last checkpoint; its backfill is queued and nothing was written",
+            ),
             Self::Bound {
                 bound,
                 limit,

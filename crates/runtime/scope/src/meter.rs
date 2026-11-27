@@ -310,9 +310,8 @@ impl Meter {
         match class {
             Class::History => self.admission.admitted(call).await,
             Class::Legacy if self.serving() => self.admission.admitted(call).await,
-            Class::Legacy | Class::Load | Class::Append | Class::Checkpoint | Class::Adopt => {
-                call.await
-            }
+            Class::Adopt => self.admission.backfilled(call).await,
+            Class::Legacy | Class::Load | Class::Append | Class::Checkpoint => call.await,
         }
     }
 

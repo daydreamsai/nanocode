@@ -774,6 +774,14 @@ impl Resident for ThreadFold {
         }
     }
 
+    fn adoption<'a>(
+        &'a self,
+        log: &'a Arc<dyn LogHost>,
+        scope: &'a str,
+    ) -> StoreFuture<'a, Result<bool, StoreError>> {
+        Box::pin(adopt::due(log, scope))
+    }
+
     fn adopt<'a>(
         &'a self,
         log: &'a Arc<dyn LogHost>,
