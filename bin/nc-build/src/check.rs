@@ -24,7 +24,7 @@ const USAGE: &str = "usage: nc-build check [--full] [--base REF] [-j N] [--seeds
   with their dependents (cargo check --locked: --lib --bins --examples native, --lib wasm32), the simulator's --tidy and --machines walks, and the pass jobs and canaries of
   bin/nanocode-sim/cfo.sh's table for every scenario that reaches them; --full: the whole workspace, every scenario and canary, and
   cargo test --lib --bins of the crates in FULL_TESTS
-  -j N: parallel jobs (default: CARGO_BUILD_JOBS, else the cores this process may run on); --seeds N: seeds per pass job (default 8, 64 with --full)
+  -j N: parallel jobs (default: CARGO_BUILD_JOBS, else the cores this process may run on); --seeds N: seeds per pass job (default 8, 64 with --full; a pass:M job runs at least M)
   a canary passes once a seed catches it, trying seeds 0, then 1..8, then the rest of its budget in units of 16 seeds;
   a unit that gives no result within NANOCODE_CHECK_UNIT_TIMEOUT seconds (default 120) fails; logs: output/check/<check>.log
   --plan: print the crates line, the scenarios line and the simulator jobs, and run nothing";

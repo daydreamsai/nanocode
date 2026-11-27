@@ -7,7 +7,8 @@
 #                          (cargo test --lib --bins) of the crates whose tests pass (FULL_TESTS in bin/nc-build/src/check.rs)
 # Options: --base REF (diff base; default: merge-base with the upstream, or HEAD~1 when nothing
 #   differs), -j N (parallel jobs; default: CARGO_BUILD_JOBS, else the cores it may run on),
-#   --seeds N (seeds per pass job; default 8, 64 with --full), --no-sim, --plan (print the scope only).
+#   --seeds N (seeds per pass job; default 8, 64 with --full; a pass:M job in cfo.sh runs at least M),
+#   --no-sim, --plan (print the scope only).
 # The engine is 'nc-build check' (bin/nc-build, crates/runtime/build-opt), built from this worktree
 # in the fast profile, so a change to the gate checks itself. Logs: output/check/<check>.log.
 # Target dir: cargo's (CARGO_TARGET_DIR, else the box cargo shim's <worktree>/target, else ./target),
@@ -21,7 +22,7 @@
 set -uo pipefail
 root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 cd "$root"
-case " $* " in *" -h "* | *" --help "*) sed -n '2,20p' "$0"; exit 0 ;; esac
+case " $* " in *" -h "* | *" --help "*) sed -n '2,21p' "$0"; exit 0 ;; esac
 export SHIPPY_REMOTE_BUILD=0 CARGO_TERM_COLOR=never
 # python-capi's wasm32 libc++ needs clang 22 (as scripts/pin-rebuild.sh sets); an explicit NANOCODE_CC wins.
 if [ -z "${NANOCODE_CC:-}" ] && [ -x /usr/lib/llvm-22/bin/clang ]; then export NANOCODE_CC=/usr/lib/llvm-22/bin/clang PATH=/usr/lib/llvm-22/bin:$PATH; fi

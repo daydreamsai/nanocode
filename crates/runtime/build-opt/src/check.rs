@@ -293,20 +293,20 @@ pub fn sim_jobs(
         if !scenario.is_some_and(|scenario| wanted.contains(scenario)) {
             continue;
         }
+        let budget = |text: &str| -> Result<u64, TableError> {
+            text.split(':')
+                .next()
+                .unwrap_or(text)
+                .parse()
+                .map_err(|_| TableError::Budget(row.join(" ")))
+        };
         let (kind, seeds) = match row[2].as_str() {
             "pass" => (Kind::Pass, pass_seeds),
             "canary" => (Kind::Canary, CANARY_SEEDS),
-            other => match other.strip_prefix("canary:") {
-                Some(budget) => (
-                    Kind::Canary,
-                    budget
-                        .split(':')
-                        .next()
-                        .unwrap_or(budget)
-                        .parse()
-                        .map_err(|_| TableError::Budget(row.join(" ")))?,
-                ),
-                None => continue,
+            other => match other.split_once(':') {
+                Some(("pass", floor)) => (Kind::Pass, pass_seeds.max(budget(floor)?)),
+                Some(("canary", seeds)) => (Kind::Canary, budget(seeds)?),
+                _ => continue,
             },
         };
         jobs.push(SimJob {

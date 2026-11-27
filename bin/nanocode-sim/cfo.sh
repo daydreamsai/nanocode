@@ -528,7 +528,7 @@ default_table='
 1 canary_thread_scope_tail_unbounded canary:16 --scenario thread_scope --mutation tail_unbounded
 1 canary_thread_scope_open_per_request canary:16 --scenario thread_scope --mutation open_per_request
 1 canary_thread_scope_adopt_in_request canary:16 --scenario thread_scope --mutation adopt_in_request
-4 flips pass --scenario flips
+4 flips pass:64 --scenario flips
 1 flips_twice pass --scenario flips --twice
 1 canary_flips_flip_off_unreadable canary:16 --scenario flips --mutation flip_off_unreadable
 1 canary_flips_legacy_open_claims canary:16 --scenario flips --mutation legacy_open_claims
@@ -820,7 +820,7 @@ run_job() {
   ok=false
   message=""
   case $kind in
-    pass) [ "$status" -eq 0 ] && ok=true ;;
+    pass | pass:*) [ "$status" -eq 0 ] && ok=true ;;
     canary*)
       caught=$(sed -n 's/^MUTATION .* caught by \([0-9]*\) seeds.*/\1/p' "$out" | tail -1)
       floor=1
@@ -838,14 +838,14 @@ run_job() {
   fi
   local replay="$bin --seeds $seed..$end $flags" known=false line log_name=""
   [ "$ok" = false ] && log_name=$started-$name-$seed.log
-  if [ "$ok" = false ] && [ "$kind" = pass ] && [ "$failed" -gt 0 ] && grep -q '^FAIL' "$out"; then
+  if [ "$ok" = false ] && [ "${kind%%:*}" = pass ] && [ "$failed" -gt 0 ] && grep -q '^FAIL' "$out"; then
     known=true
     while read -r line; do
       known_failure "$name" "$line" || { known=false; break; }
     done < <(grep '^FAIL' "$out")
   fi
   record "{\"time\":$started,\"commit\":\"$sha\",\"scenario\":\"$name\",\"kind\":\"$kind\",\"seed\":$seed,\"count\":$count,\"ok\":$ok,\"known\":$known,\"exit\":$status,\"timed_out\":$timed_out,\"passed\":$passed,\"failed\":$failed,\"wall_secs\":$wall,\"log\":\"$log_name\",\"replay\":\"$(json_text "$replay")\",\"message\":\"$(json_text "$message")\"}"
-  if [ "$kind" = pass ]; then
+  if [ "${kind%%:*}" = pass ]; then
     grep '^FAIL' "$out" | head -32 | while read -r line; do
       local failing command seen=false
       known_failure "$name" "$line" && seen=true
