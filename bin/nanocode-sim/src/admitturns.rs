@@ -10,7 +10,7 @@ use std::{
 use nanocode::{
     backend::Prompt,
     session_host::{Submission, Submitted},
-    turnlog::{OneLog, Policy, ThreadLogs, ThreadPath, ThreadPaths},
+    turnlog::{OneLog, OneLogOver, Policy, ThreadLogs, ThreadPath, ThreadPaths},
 };
 use nanocode_agent_core::ExecutionPolicyDisposition;
 use nanocode_durability_core::{StoreError, StoreFuture};
@@ -152,11 +152,19 @@ impl LogHost for Slow {
     }
 }
 
-struct Legacy;
+const ANCHOR: &str = "resident-anchor";
+
+struct Legacy {
+    anchored: bool,
+}
 
 impl ThreadPaths for Legacy {
-    fn path(&self, _thread: &str) -> ThreadPath {
-        ThreadPath::Legacy
+    fn path(&self, thread: &str) -> ThreadPath {
+        if self.anchored && thread == ANCHOR {
+            ThreadPath::Resident
+        } else {
+            ThreadPath::Legacy
+        }
     }
 }
 
@@ -165,7 +173,7 @@ struct Pod {
     slow: Arc<Slow>,
 }
 
-fn pod(world: &World, name: &str, capacity: u32) -> (threadscope::Node, Pod) {
+fn pod(world: &World, name: &str, capacity: u32, anchored: bool) -> (threadscope::Node, Pod) {
     let mut kept = None;
     let node = world.node_wrapped(name, |log| {
         let slow = Arc::new(Slow {
@@ -177,7 +185,7 @@ fn pod(world: &World, name: &str, capacity: u32) -> (threadscope::Node, Pod) {
         (slow as Arc<dyn LogHost>, None)
     });
     let slow = kept.expect("the node wraps its host once");
-    let logs = Arc::new(node.logs.clone().with_paths(Arc::new(Legacy)));
+    let logs = Arc::new(node.logs.clone().with_paths(Arc::new(Legacy { anchored })));
     (node, Pod { logs, slow })
 }
 
@@ -274,28 +282,27 @@ fn seeded_history(world: &World, pod: &Pod, threads: &[String]) -> bool {
     true
 }
 
-struct Burst<'a> {
+struct Plan<'a> {
     clock: &'a Arc<Clock>,
-    pod: &'a Pod,
     threads: &'a [String],
     bounds: Bounds,
 }
 
-fn burst(world: &World, rng: &mut Rng, burst: &Burst<'_>) -> Option<Vec<Ran>> {
+fn burst(world: &World, rng: &mut Rng, plan: &Plan<'_>, pod: &Pod) -> Option<Vec<Ran>> {
     let answers: Atom<Vec<Ran>> = Atom::default();
-    let tasks = burst
+    let tasks = plan
         .threads
         .iter()
         .map(|thread| {
-            let (answers, logs) = (&answers, Arc::clone(&burst.pod.logs));
+            let (answers, logs) = (&answers, Arc::clone(&pod.logs));
             Box::pin(async move {
-                let ran = turn(logs, burst.clock, thread, burst.bounds).await;
+                let ran = turn(logs, plan.clock, thread, plan.bounds).await;
                 answers.update(|answers| answers.push(ran.clone()));
             }) as Task<'_>
         })
         .collect();
     let scheduler = Rng::derive(rng.below(u64::MAX), "pod start");
-    match Executor::new(Arc::clone(burst.clock), scheduler).run(tasks, None) {
+    match Executor::new(Arc::clone(plan.clock), scheduler).run(tasks, None) {
         Ended::Finished => Some(answers.read(Clone::clone)),
         ended => {
             flag(
@@ -339,6 +346,69 @@ fn judged(world: &World, pod: &Pod, answers: &[Ran], stats: &mut TurnStats) {
     }
 }
 
+fn idle(world: &World, pod: &Pod, answers: &[Ran], stats: &mut TurnStats) {
+    stats.turns += answers.len() as u64;
+    for answer in answers {
+        match answer {
+            Ran::Accepted { refusals: 0 } => {}
+            Ran::Accepted { refusals } | Ran::Late { refusals } => flag(
+                &world.wrong,
+                format!(
+                    "I17: a process with no resident scope refused a legacy open {refusals} times"
+                ),
+            ),
+            Ran::Wrong(wrong) => flag(&world.wrong, wrong.clone()),
+        }
+    }
+    let admitted = pod.logs.scopes().stats().admissions;
+    if admitted > 0 {
+        flag(
+            &world.wrong,
+            format!("I17: a process with no resident scope admitted {admitted} legacy reads"),
+        );
+    }
+}
+
+fn anchored(world: &World, pod: &Pod) -> Option<Arc<OneLogOver>> {
+    let policy = Policy::default();
+    let opened = OneLog::over(Arc::clone(&pod.logs), ANCHOR, &policy);
+    match driven(world, "the resident anchor", opened)? {
+        Ok(over) if pod.logs.scopes().stats().residents > 0 => Some(over),
+        Ok(_) => {
+            flag(
+                &world.wrong,
+                "the resident anchor holds no resident scope".to_owned(),
+            );
+            None
+        }
+        Err(error) => {
+            flag(&world.wrong, format!("the resident anchor opens: {error}"));
+            None
+        }
+    }
+}
+
+fn restarted(
+    world: &World,
+    rng: &mut Rng,
+    plan: &Plan<'_>,
+    name: &str,
+    anchor: bool,
+) -> Option<(Pod, Vec<Ran>)> {
+    world.expire();
+    let (node, pod) = pod(world, name, plan.bounds.capacity, anchor);
+    publish(world, std::slice::from_ref(&node));
+    let anchored = if anchor {
+        Some(anchored(world, &pod)?)
+    } else {
+        None
+    };
+    pod.slow.slow.store(true, Ordering::Relaxed);
+    let answers = burst(world, rng, plan, &pod)?;
+    drop(anchored);
+    Some((pod, answers))
+}
+
 pub fn run(rng: &mut Rng, clock: &Arc<Clock>, stats: &mut TurnStats) -> Option<String> {
     let capacity = rng.range(CAPACITY.start, CAPACITY.end);
     let count = rng.range(THREADS.start, THREADS.end);
@@ -347,28 +417,26 @@ pub fn run(rng: &mut Rng, clock: &Arc<Clock>, stats: &mut TurnStats) -> Option<S
     let deadline_ms = DEADLINE_MARGIN * waves * READS_PER_OPEN_MAX * READ_MS + admit_ms;
     let world = threadscope::world(rng, clock).admitting(admit_ms);
     let threads: Vec<String> = (0..count).map(|at| format!("resumed-{at}")).collect();
-    let bounds = Bounds {
-        capacity: u32::try_from(capacity).expect("a capacity fits"),
-        admit_ms,
-        deadline_ns: deadline_ms * NANOS_PER_MS,
+    let plan = Plan {
+        clock,
+        threads: &threads,
+        bounds: Bounds {
+            capacity: u32::try_from(capacity).expect("a capacity fits"),
+            admit_ms,
+            deadline_ns: deadline_ms * NANOS_PER_MS,
+        },
     };
-    let (writer, before) = pod(&world, "pod-before", bounds.capacity);
+    let (writer, before) = pod(&world, "pod-before", plan.bounds.capacity, false);
     publish(&world, std::slice::from_ref(&writer));
-    if seeded_history(&world, &before, &threads) {
-        drop(before);
-        world.expire();
-        let (node, after) = pod(&world, "pod-after", bounds.capacity);
-        publish(&world, std::slice::from_ref(&node));
-        after.slow.slow.store(true, Ordering::Relaxed);
-        let started = Burst {
-            clock,
-            pod: &after,
-            threads: &threads,
-            bounds,
-        };
-        if let Some(answers) = burst(&world, rng, &started) {
-            judged(&world, &after, &answers, stats);
-        }
+    if !seeded_history(&world, &before, &threads) {
+        return world.wrong.read(Clone::clone);
+    }
+    drop(before);
+    if let Some((pod, answers)) = restarted(&world, rng, &plan, "pod-idle", false) {
+        idle(&world, &pod, &answers, stats);
+    }
+    if let Some((pod, answers)) = restarted(&world, rng, &plan, "pod-serving", true) {
+        judged(&world, &pod, &answers, stats);
     }
     world.wrong.read(Clone::clone)
 }

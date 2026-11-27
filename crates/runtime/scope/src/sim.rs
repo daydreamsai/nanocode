@@ -22,6 +22,7 @@ pub enum Mutation {
     AdmissionUnbounded,
     ColdLoadDuplicated,
     RoutesPastExpiry,
+    LegacyAdmittedIdle,
 }
 
 impl Mutation {
@@ -43,10 +44,11 @@ impl Mutation {
         Self::RoutesPastExpiry,
     ];
 
-    pub const ADMISSION: [Self; 3] = [
+    pub const ADMISSION: [Self; 4] = [
         Self::AdmissionUnbounded,
         Self::ColdLoadDuplicated,
         Self::MeterSkipsWriterTask,
+        Self::LegacyAdmittedIdle,
     ];
 
     #[must_use]
@@ -71,6 +73,7 @@ impl Mutation {
             Self::AdmissionUnbounded => "admission_unbounded",
             Self::ColdLoadDuplicated => "cold_load_duplicated",
             Self::RoutesPastExpiry => "routes_past_expiry",
+            Self::LegacyAdmittedIdle => "legacy_admitted_idle",
         }
     }
 

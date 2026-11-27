@@ -308,9 +308,17 @@ impl Meter {
         call: impl Future<Output = Result<T, StoreError>>,
     ) -> Result<T, StoreError> {
         match class {
-            Class::History | Class::Legacy => self.admission.admitted(call).await,
-            Class::Load | Class::Append | Class::Checkpoint | Class::Adopt => call.await,
+            Class::History => self.admission.admitted(call).await,
+            Class::Legacy if self.serving() => self.admission.admitted(call).await,
+            Class::Legacy | Class::Load | Class::Append | Class::Checkpoint | Class::Adopt => {
+                call.await
+            }
         }
+    }
+
+    fn serving(&self) -> bool {
+        sim::mutated(Mutation::LegacyAdmittedIdle)
+            || self.tallies.read(|tallies| !tallies.is_empty())
     }
 }
 
