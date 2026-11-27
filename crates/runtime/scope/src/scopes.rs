@@ -44,6 +44,7 @@ pub struct Stats {
     pub checkpoint_listings_whole: u64,
     pub checkpoint_failures: u64,
     pub adoptions: u64,
+    pub adoption_resumes: u64,
     pub adoption_rows: u64,
     pub adoption_bytes: u64,
     pub evictions: u64,
@@ -67,6 +68,7 @@ pub struct Stats {
 #[derive(Clone, Debug, Default)]
 pub struct Backfilled {
     pub adopted: u64,
+    pub resumed: u64,
     pub current: u64,
     pub dropped: u64,
     pub failed: Vec<(String, ScopeError)>,
@@ -85,6 +87,7 @@ struct Quiet {
 
 enum Backfill {
     Adopted,
+    Resumed,
     Current,
     Dropped,
 }
@@ -109,6 +112,7 @@ struct Loaded<S> {
     parts: u64,
     tail: Vec<(u64, String)>,
     adopted: Option<(u64, u64)>,
+    raced: bool,
 }
 
 struct Flights<V>(Atom<OrdMap<Arc<str>, Vector<Waiter<V>>>>);
@@ -769,6 +773,7 @@ impl<F: Resident> Inner<F> {
                         parts,
                         tail,
                         adopted: None,
+                        raced: false,
                     }),
                     Some((seq, _)) => self.unadopted(scope, due, now, Some(*seq)).await,
                 }
@@ -814,7 +819,7 @@ impl<F: Resident> Inner<F> {
         foreign: Option<u64>,
     ) -> Result<Loaded<F::State>, ScopeError> {
         if sim::mutated(Mutation::AdoptInRequest) {
-            if let Some(loaded) = self.adoption(scope, now, foreign).await? {
+            if let Some(loaded) = self.adoption(scope, now, foreign, None).await? {
                 return Ok(loaded);
             }
             return self.fresh(scope, due, now).await;
@@ -838,6 +843,7 @@ impl<F: Resident> Inner<F> {
             parts: 0,
             tail,
             adopted: None,
+            raced: false,
         })
     }
 
@@ -851,6 +857,10 @@ impl<F: Resident> Inner<F> {
             });
             match outcome {
                 Ok(Backfill::Adopted) => backfilled.adopted += 1,
+                Ok(Backfill::Resumed) => {
+                    self.watch(&scope);
+                    backfilled.resumed += 1;
+                }
                 Ok(Backfill::Current) => backfilled.current += 1,
                 Ok(Backfill::Dropped) => backfilled.dropped += 1,
                 Err(error) => {
@@ -916,6 +926,11 @@ impl<F: Resident> Inner<F> {
             tally: Arc::clone(&tally),
         };
         let landed = match loaded {
+            Ok(Some(loaded)) if self.leases.held(due.part) == Some(due.epoch) && loaded.raced => {
+                self.sealed(Arc::clone(scope), placed, loaded)
+                    .await
+                    .map(|()| Backfill::Resumed)
+            }
             Ok(Some(loaded)) if self.leases.held(due.part) == Some(due.epoch) => self
                 .resident_from(Arc::clone(scope), placed, loaded)
                 .await
@@ -927,7 +942,10 @@ impl<F: Resident> Inner<F> {
         if !matches!(landed, Ok(Backfill::Adopted)) {
             self.meter.leave(scope, &tally);
         }
-        if landed.is_ok() {
+        if matches!(
+            landed,
+            Ok(Backfill::Adopted | Backfill::Current | Backfill::Dropped)
+        ) {
             self.undue(scope, due);
         }
         landed
@@ -936,17 +954,68 @@ impl<F: Resident> Inner<F> {
     async fn backfilled(&self, scope: &str) -> Result<Option<Loaded<F::State>>, ScopeError> {
         let admission = self.meter.admission();
         let now = (self.clock)();
-        let foreign = match admission.backfilled(self.meter.latest(scope)).await? {
-            Some(manifest) => {
-                let tail = self.logs.adopt.scan(scope, manifest.seq, SCAN_END).await?;
-                match tail.iter().find(|(_, row)| self.fold.foreign(row)) {
-                    None => return Ok(None),
-                    Some((seq, _)) => Some(*seq),
-                }
-            }
-            None => None,
+        let Some(manifest) = admission.backfilled(self.meter.latest(scope)).await? else {
+            return self.adoption(scope, now, None, None).await;
         };
-        self.adoption(scope, now, foreign).await
+        let tail = self.logs.adopt.scan(scope, manifest.seq, SCAN_END).await?;
+        let Some((foreign, _)) = tail.iter().find(|(_, row)| self.fold.foreign(row)) else {
+            return Ok(None);
+        };
+        let foreign = *foreign;
+        drop(tail);
+        if sim::mutated(Mutation::BackfillRereadsHistory) {
+            return self.adoption(scope, now, Some(foreign), None).await;
+        }
+        let at = manifest.seq;
+        let (checkpointed, next, _, _) = admission
+            .backfilled(self.restore(scope, manifest, now))
+            .await?;
+        assert_eq!(
+            next, at,
+            "a restored checkpoint of {scope} resumes at its manifest"
+        );
+        assert!(
+            foreign >= at,
+            "a foreign row of {scope} lies past its checkpoint"
+        );
+        self.adoption(scope, now, Some(foreign), Some(checkpointed))
+            .await
+    }
+
+    async fn sealed(
+        &self,
+        scope: Arc<str>,
+        placed: Placed,
+        loaded: Loaded<F::State>,
+    ) -> Result<(), ScopeError> {
+        assert!(
+            loaded.raced,
+            "only a raced adoption of {scope} is sealed aside"
+        );
+        assert!(
+            loaded.tail.is_empty(),
+            "a raced adoption of {scope} seals the state it read, without the rows past it"
+        );
+        let Some((rows, bytes)) = loaded.adopted else {
+            panic!("a raced adoption of {scope} counts what it read");
+        };
+        let weight = self.fold.weight(&loaded.state);
+        let core = Core {
+            state: Arc::new(loaded.state),
+            next: loaded.next,
+            since: 0,
+            checkpointed: loaded.checkpointed,
+            staged: None,
+            stamps: Stamps::new(placed.epoch),
+        };
+        let owner = Owner::new(scope, placed, core, weight, self.touch());
+        owner.seal(self).await?;
+        self.stats.update(|stats| {
+            stats.adoption_resumes += 1;
+            stats.adoption_rows += rows;
+            stats.adoption_bytes += bytes;
+        });
+        Ok(())
     }
 
     async fn resident_from(
@@ -962,7 +1031,12 @@ impl<F: Resident> Inner<F> {
             parts,
             tail,
             adopted,
+            raced,
         } = loaded;
+        assert!(
+            !raced,
+            "a raced adoption of {scope} is sealed aside, never served"
+        );
         let mut at = next;
         for (seq, row) in &tail {
             if *seq < at {
@@ -1009,13 +1083,18 @@ impl<F: Resident> Inner<F> {
         scope: &str,
         now: u64,
         foreign: Option<u64>,
+        checkpointed: Option<F::State>,
     ) -> Result<Option<Loaded<F::State>>, ScopeError> {
+        let adopted = match checkpointed {
+            Some(state) => self.fold.resume(&self.logs.adopt, scope, state).await?,
+            None => self.fold.adopt(&self.logs.adopt, scope).await?,
+        };
         let Adopted {
             state,
             next,
             rows,
             bytes,
-        } = match (self.fold.adopt(&self.logs.adopt, scope).await?, foreign) {
+        } = match (adopted, foreign) {
             (None, None) => return self.plain(scope, now).await.map(Some),
             (None, Some(seq)) => {
                 return Err(ScopeError::Store(StoreError::Backend(format!(
@@ -1026,7 +1105,8 @@ impl<F: Resident> Inner<F> {
         };
         assert!(next > 0, "an adopted history of {scope} ends past row 0");
         let tail = self.logs.adopt.scan(scope, next, SCAN_END).await?;
-        if tail.iter().any(|(_, row)| self.fold.foreign(row)) {
+        let raced = tail.iter().any(|(_, row)| self.fold.foreign(row));
+        if raced && sim::mutated(Mutation::BackfillRereadsHistory) {
             return Err(ScopeError::Unadopted);
         }
         Ok(Some(Loaded {
@@ -1034,8 +1114,9 @@ impl<F: Resident> Inner<F> {
             next,
             checkpointed: Checkpointed::empty(now),
             parts: 0,
-            tail,
+            tail: if raced { Vec::new() } else { tail },
             adopted: Some((rows, bytes)),
+            raced,
         }))
     }
 
@@ -1050,6 +1131,7 @@ impl<F: Resident> Inner<F> {
             parts: 0,
             adopted: Some((tail.len() as u64, bytes as u64)),
             tail,
+            raced: false,
         })
     }
 

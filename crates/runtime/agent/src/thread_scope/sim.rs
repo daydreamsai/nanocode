@@ -40,6 +40,7 @@ pub enum Mutation {
     AdoptionKeepsHistory,
     AdoptedServesLegacy,
     ReplacedFoldKept,
+    SwitchMissesTail,
 }
 
 impl Mutation {
@@ -114,6 +115,7 @@ impl Mutation {
             Self::AdoptionKeepsHistory => "adoption_keeps_history",
             Self::AdoptedServesLegacy => "adopted_serves_legacy",
             Self::ReplacedFoldKept => "replaced_fold_kept",
+            Self::SwitchMissesTail => "switch_misses_tail",
         }
     }
 

@@ -112,6 +112,15 @@ pub trait Resident: Send + Sync + 'static {
     ) -> StoreFuture<'a, Result<Option<Adopted<Self::State>>, StoreError>> {
         Box::pin(std::future::ready(Ok(None)))
     }
+
+    fn resume<'a>(
+        &'a self,
+        log: &'a Arc<dyn LogHost>,
+        scope: &'a str,
+        _checkpointed: Self::State,
+    ) -> StoreFuture<'a, Result<Option<Adopted<Self::State>>, StoreError>> {
+        self.adopt(log, scope)
+    }
 }
 
 #[derive(Clone, Debug)]

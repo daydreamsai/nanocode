@@ -26,7 +26,7 @@ use crate::{
 
 const THREADS: Range<u64> = 16..96;
 const CAPACITY: Range<u64> = 1..5;
-const READ_MS: u64 = 5;
+pub(crate) const READ_MS: u64 = 5;
 const WAVES_PER_ADMISSION: u64 = 4;
 const READS_PER_OPEN_MAX: u64 = 8;
 const DEADLINE_MARGIN: u64 = 2;
@@ -49,13 +49,25 @@ impl TurnStats {
     }
 }
 
-struct Slow {
+pub(crate) struct Slow {
     log: Arc<dyn LogHost>,
     capacity: u32,
     slow: AtomicBool,
 }
 
 impl Slow {
+    pub(crate) const fn new(log: Arc<dyn LogHost>, capacity: u32) -> Self {
+        Self {
+            log,
+            capacity,
+            slow: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn paced(&self, slow: bool) {
+        self.slow.store(slow, Ordering::Relaxed);
+    }
+
     async fn read<T>(&self, call: StoreFuture<'_, Result<T, StoreError>>) -> Result<T, StoreError> {
         if self.slow.load(Ordering::Relaxed) {
             nanocode_platform::sleep(Duration::from_millis(READ_MS)).await;
@@ -176,11 +188,7 @@ struct Pod {
 fn pod(world: &World, name: &str, capacity: u32, anchored: bool) -> (threadscope::Node, Pod) {
     let mut kept = None;
     let node = world.node_wrapped(name, |log| {
-        let slow = Arc::new(Slow {
-            log,
-            capacity,
-            slow: AtomicBool::new(false),
-        });
+        let slow = Arc::new(Slow::new(log, capacity));
         kept = Some(Arc::clone(&slow));
         (slow as Arc<dyn LogHost>, None)
     });
@@ -403,7 +411,7 @@ fn restarted(
     } else {
         None
     };
-    pod.slow.slow.store(true, Ordering::Relaxed);
+    pod.slow.paced(true);
     let answers = burst(world, rng, plan, &pod)?;
     drop(anchored);
     Some((pod, answers))

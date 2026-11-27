@@ -27,10 +27,11 @@ pub enum Mutation {
     AdoptInRequest,
     BackfillTakesServingLanes,
     ReleaseStopsAtDrain,
+    BackfillRereadsHistory,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::CheckpointIndexesOnly,
         Self::ReadThroughWriter,
         Self::PublishBeforeCommit,
@@ -48,6 +49,7 @@ impl Mutation {
         Self::RoutesPastExpiry,
         Self::ChainInStoreOrder,
         Self::ReleaseStopsAtDrain,
+        Self::BackfillRereadsHistory,
     ];
 
     pub const ADMISSION: [Self; 5] = [
@@ -85,6 +87,7 @@ impl Mutation {
             Self::AdoptInRequest => "adopt_in_request",
             Self::BackfillTakesServingLanes => "backfill_takes_serving_lanes",
             Self::ReleaseStopsAtDrain => "release_stops_at_drain",
+            Self::BackfillRereadsHistory => "backfill_rereads_history",
         }
     }
 

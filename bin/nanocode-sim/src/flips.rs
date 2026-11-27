@@ -6,22 +6,32 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use nanocode::{
     backend::Prompt,
-    session_host::{LogEntry, Submission, Submitted, TurnRecord, TurnState},
+    session_host::{LogEntry, Started, Submission, Submitted, TurnRecord, TurnState},
     turnlog::{
         OneLog, OneLogOver, Policy, ThreadCommand, ThreadPath, ThreadPaths, ThreadState,
         thread_scope_sim::{self, Mutation},
     },
 };
 use nanocode_durability_core::StoreError;
-use nanocode_scope::{Resident, ScopeError, switches};
-use nanocode_turnlog::{Format, Formats, LogHost, sim as log_sim};
+use nanocode_scope::Backfilled;
+use nanocode_scope::{
+    Resident, ScopeError, sim as scope_sim, sim::Mutation as ScopeMutation, switches,
+};
+use nanocode_sync::future::join;
+use nanocode_turnlog::{
+    Format, Formats, LogHost, SCAN_END,
+    adopt::{self, Reading},
+    sim as log_sim,
+};
 use serde_json::{Map, json};
 
 use crate::{
+    admitturns::{self, Slow},
     executor::Clock,
     rng::{FNV_OFFSET, Rng, fnv},
     threadcompat, threadlegacy,
@@ -42,6 +52,11 @@ const RECENT_ROWS: usize = 1 << 16;
 const DRIVEN: [&str; 2] = ["thread_path", "row_format"];
 const RESTARTS: u64 = 2 * ROUNDS.end;
 const QUIET_PASSES: u64 = 2;
+const RACE_PPM: u64 = 500_000;
+const RACE_READS: Range<u64> = 0..24;
+const RACE_START_PPM: u64 = 500_000;
+const SWITCHES: u64 = 2;
+const ADOPTION_PASSES: u64 = 4;
 const SNAPSHOT_PPM: u64 = 750_000;
 const SNAPSHOT_ROWS: Range<u64> = 2..8;
 
@@ -53,16 +68,20 @@ pub enum FlipsMutation {
     ResidentDropsBlob,
     ClaimSkipsRow,
     AdoptedServesLegacy,
+    BackfillRereadsHistory,
+    SwitchMissesTail,
 }
 
 impl FlipsMutation {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::None,
         Self::FlipOffUnreadable,
         Self::LegacyOpenClaims,
         Self::ResidentDropsBlob,
         Self::ClaimSkipsRow,
         Self::AdoptedServesLegacy,
+        Self::BackfillRereadsHistory,
+        Self::SwitchMissesTail,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -73,6 +92,8 @@ impl FlipsMutation {
             Self::ResidentDropsBlob => "resident_drops_blob",
             Self::ClaimSkipsRow => "claim_skips_row",
             Self::AdoptedServesLegacy => "adopted_serves_legacy",
+            Self::BackfillRereadsHistory => "backfill_rereads_history",
+            Self::SwitchMissesTail => "switch_misses_tail",
         }
     }
 
@@ -84,6 +105,15 @@ impl FlipsMutation {
             Self::ResidentDropsBlob => Mutation::ResidentDropsBlob,
             Self::ClaimSkipsRow => Mutation::ClaimSkipsRow,
             Self::AdoptedServesLegacy => Mutation::AdoptedServesLegacy,
+            Self::BackfillRereadsHistory => Mutation::None,
+            Self::SwitchMissesTail => Mutation::SwitchMissesTail,
+        }
+    }
+
+    const fn scope(self) -> ScopeMutation {
+        match self {
+            Self::BackfillRereadsHistory => ScopeMutation::BackfillRereadsHistory,
+            _ => ScopeMutation::None,
         }
     }
 
@@ -116,6 +146,10 @@ pub struct FlipsStats {
     pub checked: u64,
     pub sessions: u64,
     pub held: u64,
+    pub raced: u64,
+    pub resumed: u64,
+    pub bounded: u64,
+    pub missed: u64,
 }
 
 impl FlipsStats {
@@ -131,6 +165,10 @@ impl FlipsStats {
         self.checked += other.checked;
         self.sessions += other.sessions;
         self.held += other.held;
+        self.raced += other.raced;
+        self.resumed += other.resumed;
+        self.bounded += other.bounded;
+        self.missed += other.missed;
     }
 }
 
@@ -158,6 +196,7 @@ struct Run {
     paths: Arc<Switched>,
     policy: Policy,
     node: Node,
+    slow: Arc<Slow>,
     over: Arc<OneLogOver>,
     generation: u64,
     stamped: bool,
@@ -165,6 +204,14 @@ struct Run {
     ids: Vec<String>,
     acked: BTreeMap<String, Acked>,
     sessions: Option<Sessions>,
+    adopted: Option<Adoptions>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Adoptions {
+    first: u64,
+    reads: u64,
+    opens: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -638,13 +685,14 @@ fn moved(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) ->
         }
     }
     run.generation += 1;
-    let node = world.node(&format!("f{}", run.generation));
+    let (node, slow) = paced(world, &format!("f{}", run.generation));
     publish(world, std::slice::from_ref(&node));
     if crash {
         missed(world, &node)?;
     }
     run.over = opened(world, &node, &run.paths, &run.policy)?;
     run.node = node;
+    run.slow = slow;
     let lossy = crash || legacy;
     agree(world, run, lossy, "after a node moved", stats)
 }
@@ -671,7 +719,7 @@ fn round(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) ->
         return None;
     }
     if run.over.path() != to {
-        backfilled(world, run, stats)?;
+        backfilled(rng, world, run, stats)?;
     }
     if run.over.path() != to {
         flag(
@@ -694,9 +742,139 @@ fn round(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) ->
     sessions(rng, world, run, stats)
 }
 
-fn backfilled(world: &World, run: &Run, stats: &mut FlipsStats) -> Option<()> {
-    stats.held += 1;
-    for _ in 0..QUIET_PASSES {
+fn paced(world: &World, name: &str) -> (Node, Arc<Slow>) {
+    let mut kept = None;
+    let node = world.node_wrapped(name, |log| {
+        let capacity = log.read_capacity();
+        let slow = Arc::new(Slow::new(log, capacity));
+        kept = Some(Arc::clone(&slow));
+        (slow as Arc<dyn LogHost>, None)
+    });
+    let slow = kept.expect("the node wraps its host once");
+    (node, slow)
+}
+
+fn head(world: &World) -> u64 {
+    world.rows(THREAD).last().map_or(0, |(seq, _)| seq + 1)
+}
+
+fn opened_rows(world: &World) -> Option<u64> {
+    let host = world.host();
+    let opened = driven(
+        world,
+        "an old writer's open",
+        adopt::read_all(&host, THREAD, Reading::Below(SCAN_END)),
+    )?;
+    match opened {
+        Ok(opened) => Some(opened.usage().rows),
+        Err(error) => {
+            flag(
+                &world.wrong,
+                format!("flips: the old writer opens the thread: {error}"),
+            );
+            None
+        }
+    }
+}
+
+fn bounded(
+    world: &World,
+    run: &mut Run,
+    read: u64,
+    from: u64,
+    stats: &mut FlipsStats,
+) -> Option<()> {
+    let Some(adoptions) = run.adopted.as_mut() else {
+        run.adopted = Some(Adoptions {
+            first: from,
+            reads: 0,
+            opens: 0,
+        });
+        return Some(());
+    };
+    adoptions.reads += read;
+    adoptions.opens += opened_rows(world)?;
+    let written = head(world).saturating_sub(adoptions.first);
+    let bound = ADOPTION_PASSES * (adoptions.opens + written);
+    if adoptions.reads > bound {
+        flag(
+            &world.wrong,
+            format!(
+                "flips: the thread's adoptions after its first read {} rows, past {ADOPTION_PASSES} passes over one old-writer open each ({} rows) and the {written} rows written since the first",
+                adoptions.reads, adoptions.opens
+            ),
+        );
+        return None;
+    }
+    stats.bounded += 1;
+    Some(())
+}
+
+enum Raced {
+    Submitted(String, Result<Submitted, StoreError>),
+    Started(Result<Option<Started>, StoreError>),
+}
+
+fn raced(rng: &mut Rng, world: &World, run: &mut Run) -> Option<Backfilled> {
+    let late_ms = rng.range(RACE_READS.start, RACE_READS.end) * admitturns::READ_MS;
+    let queued = live(run, rng, TurnState::Queued).filter(|_| rng.chance(RACE_START_PPM));
+    let id = format!("r{}", run.turns);
+    run.turns += 1;
+    let submission = Submission {
+        request_id: id.clone(),
+        prompt: Prompt::new(format!("raced turn {id}")),
+        hand: None,
+        metadata: raw(&json!(null)),
+    };
+    let scopes = run.node.logs.scopes();
+    let over = Arc::clone(&run.over);
+    run.slow.paced(true);
+    let raced = driven(
+        world,
+        "a backfill raced by the old writer",
+        join(scopes.backfill(), async {
+            nanocode_platform::sleep(Duration::from_millis(late_ms)).await;
+            match &queued {
+                Some(queued) => Raced::Started(over.start(queued).await),
+                None => Raced::Submitted(id, over.submit(&submission).await),
+            }
+        }),
+    );
+    run.slow.paced(false);
+    let (passed, wrote) = raced?;
+    match wrote {
+        Raced::Submitted(id, Ok(Submitted::Accepted { record, .. })) => {
+            run.ids.push(id);
+            acked(run, &record, true);
+        }
+        Raced::Submitted(id, Ok(answer)) => {
+            flag(
+                &world.wrong,
+                format!("flips: a raced turn {id} is answered {answer:?}"),
+            );
+            return None;
+        }
+        Raced::Started(Ok(Some(started))) => acked(run, &started.record, false),
+        Raced::Started(Ok(None)) => {}
+        Raced::Submitted(_, Err(error)) | Raced::Started(Err(error)) => {
+            failed(world, run, "a raced write", &error);
+            return None;
+        }
+    }
+    Some(passed)
+}
+
+fn passes(
+    rng: &mut Rng,
+    world: &World,
+    run: &mut Run,
+    race: bool,
+    stats: &mut FlipsStats,
+) -> Option<()> {
+    let mut passes = QUIET_PASSES + u64::from(race);
+    let mut pass = 0;
+    while pass < passes {
+        pass += 1;
         if !run.node.logs.scopes().adopting(THREAD) {
             flag(
                 &world.wrong,
@@ -705,7 +883,13 @@ fn backfilled(world: &World, run: &Run, stats: &mut FlipsStats) -> Option<()> {
             );
             return None;
         }
-        let passed = driven(world, "a flips backfill", run.node.logs.scopes().backfill())?;
+        let before = run.node.logs.scopes().stats().usage.adopt.rows;
+        let from = head(world);
+        let passed = if race && pass == 1 {
+            raced(rng, world, run)?
+        } else {
+            driven(world, "a flips backfill", run.node.logs.scopes().backfill())?
+        };
         if let Some((scope, error)) = passed.failed.first() {
             flag(
                 &world.wrong,
@@ -713,13 +897,35 @@ fn backfilled(world: &World, run: &Run, stats: &mut FlipsStats) -> Option<()> {
             );
             return None;
         }
+        let read = run.node.logs.scopes().stats().usage.adopt.rows - before;
+        if passed.adopted + passed.resumed > 0 {
+            bounded(world, run, read, from, stats)?;
+        }
+        if passed.resumed > 0 {
+            stats.resumed += 1;
+            stats.raced += u64::from(race && pass == 1);
+            passes = pass + QUIET_PASSES;
+        }
         if passed.adopted > 0 {
             break;
         }
     }
-    if let Err(error) = driven(world, "a flips read after its backfill", run.over.pending())? {
-        failed(world, run, "the read after a backfill", &error);
-        return None;
+    Some(())
+}
+
+fn backfilled(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) -> Option<()> {
+    stats.held += 1;
+    let race = rng.chance(RACE_PPM);
+    for round in 0..SWITCHES {
+        passes(rng, world, run, race && round == 0, stats)?;
+        if let Err(error) = driven(world, "a flips read after its backfill", run.over.pending())? {
+            failed(world, run, "the read after a backfill", &error);
+            return None;
+        }
+        if run.over.path() == ThreadPath::Resident {
+            break;
+        }
+        stats.missed += 1;
     }
     Some(())
 }
@@ -808,7 +1014,7 @@ fn started(rng: &mut Rng, world: &World) -> Option<Run> {
     let paths = Arc::new(Switched(AtomicBool::new(rng.chance(START_LEGACY_PPM))));
     let stamped = rng.chance(START_STAMPED_PPM);
     log_sim::force(Some(row_format(stamped)));
-    let node = world.node("f0");
+    let (node, slow) = paced(world, "f0");
     publish(world, std::slice::from_ref(&node));
     let snapshot_rows = rng
         .chance(SNAPSHOT_PPM)
@@ -823,6 +1029,7 @@ fn started(rng: &mut Rng, world: &World) -> Option<Run> {
         paths,
         policy,
         node,
+        slow,
         over,
         generation: 0,
         stamped,
@@ -830,6 +1037,7 @@ fn started(rng: &mut Rng, world: &World) -> Option<Run> {
         ids,
         acked: BTreeMap::new(),
         sessions,
+        adopted: None,
     })
 }
 
@@ -850,6 +1058,7 @@ fn seeded(seed: u64, mutation: FlipsMutation, time: &Arc<Clock>) -> Outcome {
     let rounds = rng.range(ROUNDS.start, ROUNDS.end);
     let shape = format!("rounds={rounds}");
     thread_scope_sim::mutate(mutation.mutation());
+    scope_sim::mutate(mutation.scope());
     if registered(&world)
         && let Some(mut run) = started(&mut rng, &world)
     {
@@ -861,6 +1070,7 @@ fn seeded(seed: u64, mutation: FlipsMutation, time: &Arc<Clock>) -> Outcome {
         stats.acked += run.acked.len() as u64;
     }
     thread_scope_sim::mutate(Mutation::None);
+    scope_sim::mutate(ScopeMutation::None);
     log_sim::force(None);
     publish(&world, &[]);
     let mut digest = fnv(FNV_OFFSET, &seed.to_le_bytes());

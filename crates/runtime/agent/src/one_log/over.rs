@@ -426,6 +426,39 @@ impl OneLogOver {
         }))
     }
 
+    async fn missed(&self, log: &ThreadLog) -> Result<bool, StoreError> {
+        let Some(next) = log.next() else {
+            return Ok(false);
+        };
+        if sim::mutated(sim::Mutation::SwitchMissesTail) {
+            return Ok(false);
+        }
+        let past = self
+            .logs
+            .scopes()
+            .legacy()
+            .scan(&self.thread, next, SCAN_END)
+            .await?;
+        assert!(
+            past.iter().all(|(seq, _)| *seq >= next),
+            "a scan of {} from row {next} answers no row below it",
+            self.thread
+        );
+        Ok(!past.is_empty())
+    }
+
+    async fn caught_up(&self, log: Arc<ThreadLog>) -> Result<Option<Arc<ThreadLog>>, StoreError> {
+        if !self.missed(&log).await? {
+            return Ok(Some(log));
+        }
+        unclaimed(&self.logs, &self.thread).await?;
+        match self.binding.rebound(Some(&log)).await {
+            Ok(log) => Ok(Some(log)),
+            Err(ScopeError::Unadopted) => Ok(None),
+            Err(error) => Err(refused(error)),
+        }
+    }
+
     async fn adopted(&self, old: &Old) -> Result<Option<Arc<Bound>>, StoreError> {
         handed_over(&old.log).await?;
         let stale = old.resident.as_ref().map(|bound| &bound.log);
@@ -438,6 +471,9 @@ impl OneLogOver {
                 Err(ScopeError::Unadopted) => return Ok(None),
                 Err(error) => return Err(refused(error)),
             },
+        };
+        let Some(log) = self.caught_up(log).await? else {
+            return Ok(None);
         };
         let Some(resident) = &old.resident else {
             let bound = Arc::new(bound(log, &self.thread, &self.policy, &self.effects)?);

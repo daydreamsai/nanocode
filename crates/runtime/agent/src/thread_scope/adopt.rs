@@ -171,12 +171,7 @@ fn keeps_history() -> bool {
     sim::mutated(Mutation::AdoptionKeepsHistory)
 }
 
-fn turns(
-    state: &mut ThreadState,
-    view: &mut View,
-    below: u64,
-    filter: FinishedFilter,
-) -> Result<(), StoreError> {
+fn all_retired(view: &View) -> Result<(), StoreError> {
     if view.retired.len() != view.retired_count {
         return Err(invalid(format!(
             "the turn log retired {} turns and its events name {} of them",
@@ -184,6 +179,15 @@ fn turns(
             view.retired.len()
         )));
     }
+    Ok(())
+}
+
+fn turns(
+    state: &mut ThreadState,
+    view: &mut View,
+    below: u64,
+    filter: FinishedFilter,
+) -> Result<(), StoreError> {
     if !sim::mutated(Mutation::AdoptionSkipsRetired) {
         for (id, _) in std::mem::take(&mut view.retired) {
             state.moved_below(&id, below, filter);
@@ -216,6 +220,7 @@ fn turns(
 
 #[derive(Default)]
 struct Seen {
+    after: u64,
     ids: BTreeSet<String>,
     last: Option<u64>,
     disorder: Option<(u64, u64)>,
@@ -223,6 +228,9 @@ struct Seen {
 
 impl Seen {
     fn take(&mut self, event: &Event) -> bool {
+        if event.seq <= self.after {
+            return true;
+        }
         if let Some(last) = self.last
             && event.seq <= last
             && self.disorder.is_none()
@@ -487,6 +495,108 @@ fn unheld(state: &ThreadState, view: &mut View, cached: &BTreeSet<Digest>) {
     view.stored.retain(|(key, _)| !history.contains(key));
 }
 
+fn moved_before(checkpointed: &ThreadState, known: &BTreeSet<String>, turn: &Turn) -> bool {
+    matches!(turn.phase, Phase::Finished { .. })
+        && !known.contains(&turn.id)
+        && checkpointed
+            .moved
+            .as_ref()
+            .is_some_and(|moved| moved.may_hold(&turn.id))
+}
+
+fn known_turns(view: &mut View, checkpointed: &ThreadState, known: &BTreeSet<String>) {
+    view.turns
+        .retain(|turn| !moved_before(checkpointed, known, turn));
+    assert!(
+        view.turns
+            .iter()
+            .all(|turn| !moved_before(checkpointed, known, turn)),
+        "a resumed adoption keeps every turn its checkpoint's filter does not hold"
+    );
+}
+
+fn carried(state: &mut ThreadState, checkpointed: &ThreadState, cached: &BTreeSet<Digest>) {
+    for digest in cached {
+        if state.blob_body(digest).is_none()
+            && let Some(body) = checkpointed.blob_body(digest)
+        {
+            state
+                .stored
+                .insert(Arc::from(digest.key().as_str()), Arc::from(body));
+        }
+    }
+}
+
+pub(super) async fn resume(
+    log: &Arc<dyn LogHost>,
+    scope: &str,
+    filter: FinishedFilter,
+    checkpointed: ThreadState,
+) -> Result<Option<Adopted<ThreadState>>, StoreError> {
+    let loaded = log.load(scope).await?;
+    let legacy = adopt::read_all(log, scope, Reading::Loaded(loaded)).await?;
+    let next = legacy.next();
+    let after_event = checkpointed.last_event;
+    let after_fact = checkpointed.next_fact() - 1;
+    let seen = legacy
+        .history(
+            after_event,
+            Seen {
+                after: after_event,
+                ..Seen::default()
+            },
+            |seen: &mut Seen, event| seen.take(event),
+        )
+        .await?;
+    let read = legacy
+        .facts_from(
+            after_fact,
+            Vec::new(),
+            move |facts: &mut Facts, seq, owner, fact| {
+                if seq > after_fact {
+                    facts.push((seq, owner.map(str::to_owned), fact.clone()));
+                }
+            },
+        )
+        .await?;
+    let mut known = seen.ids.clone();
+    known.extend(checkpointed.turns.keys().map(|id| id.as_ref().to_owned()));
+    let ids = known.clone();
+    let (mut view, last_event) = legacy
+        .read(move |fold| (View::of(fold, &ids), fold.last_event()))
+        .await;
+    seen.checked(last_event)?;
+    known_turns(&mut view, &checkpointed, &known);
+    let mut state = ThreadState {
+        moved: checkpointed.moved.clone(),
+        blobs: checkpointed.blobs.clone(),
+        logging: checkpointed.logging.clone(),
+        fact_base: after_fact,
+        ..ThreadState::default()
+    };
+    turns(&mut state, &mut view, next, filter)?;
+    facts(&mut state, &read)?;
+    let cached = cached_blobs(&view);
+    unheld(&state, &mut view, &cached);
+    keep(&mut state, view);
+    carried(&mut state, &checkpointed, &cached);
+    bodies(&legacy, &mut state, &cached).await?;
+    state.cache_only = cached.iter().copied().collect();
+    state.last_event = last_event;
+    state.legacy = Some(Legacy {
+        next,
+        last_event,
+        last_fact: state.fact_base,
+    });
+    let usage = legacy.usage();
+    Ok(Some(Adopted {
+        state,
+        next,
+        rows: usage.rows,
+        bytes: usage.bytes,
+    }))
+}
+
 pub(super) async fn adopt(
     log: &Arc<dyn LogHost>,
     scope: &str,
@@ -511,6 +621,7 @@ pub(super) async fn adopt(
         .read(move |fold| (View::of(fold, &ids), fold.last_event()))
         .await;
     seen.checked(last_event)?;
+    all_retired(&view)?;
     let mut state = ThreadState::default();
     turns(&mut state, &mut view, next, filter)?;
     facts(&mut state, &read)?;

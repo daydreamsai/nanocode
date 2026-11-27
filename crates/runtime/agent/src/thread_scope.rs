@@ -792,6 +792,20 @@ impl Resident for ThreadFold {
     ) -> StoreFuture<'a, Result<Option<Adopted<ThreadState>>, StoreError>> {
         Box::pin(adopt::adopt(log, scope, self.policy.finished_filter))
     }
+
+    fn resume<'a>(
+        &'a self,
+        log: &'a Arc<dyn LogHost>,
+        scope: &'a str,
+        checkpointed: ThreadState,
+    ) -> StoreFuture<'a, Result<Option<Adopted<ThreadState>>, StoreError>> {
+        Box::pin(adopt::resume(
+            log,
+            scope,
+            self.policy.finished_filter,
+            checkpointed,
+        ))
+    }
 }
 
 #[derive(Clone)]

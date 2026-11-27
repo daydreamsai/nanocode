@@ -535,6 +535,8 @@ default_table='
 1 canary_flips_resident_drops_blob canary:16 --scenario flips --mutation resident_drops_blob
 1 canary_flips_claim_skips_row canary:16 --scenario flips --mutation claim_skips_row
 1 canary_flips_adopted_serves_legacy canary:16 --scenario flips --mutation adopted_serves_legacy
+1 canary_flips_backfill_rereads_history canary:16 --scenario flips --mutation backfill_rereads_history
+1 canary_flips_switch_misses_tail canary:64 --scenario flips --mutation switch_misses_tail
 8 repo_cache pass --scenario repo_cache
 2 repo_cache_twice pass --scenario repo_cache --twice
 1 canary_repo_cache_shared_head canary:8 --scenario repo_cache --mutation shared_head
