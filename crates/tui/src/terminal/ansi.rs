@@ -247,6 +247,8 @@ pub const ENABLE_COLOR_SCHEME_UPDATES: &str = "\x1b[?2031h";
 pub const DISABLE_COLOR_SCHEME_UPDATES: &str = "\x1b[?2031l";
 pub const QUERY_BACKGROUND_COLOR: &str = "\x1b]11;?\x1b\\";
 pub const QUERY_COLOR_SCHEME: &str = "\x1b[?996n";
+pub const QUERY_PROGRAM_STATUS: &str = "\x1b]7501;?\x1b\\";
+pub const CLEAR_PROGRAM_STATUS: &str = "\x1b]7501;state=clear\x1b\\";
 pub const HIDE_CURSOR: &str = "\x1b[?25l";
 pub const SHOW_CURSOR: &str = "\x1b[?25h";
 pub const CLEAR_LINE: &str = "\x1b[2K";
@@ -257,6 +259,25 @@ const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const BASE64_PADDING: u8 = b'=';
 const SEXTET_MASK: u32 = 0b11_1111;
+
+pub(crate) fn program_status(bytes: &mut Vec<u8>, app: &str, status: super::ProgramStatus) {
+    use super::{Blocker, ProgramStatus};
+    assert!(
+        (1..=32).contains(&app.len())
+            && app
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(&byte)),
+        "a program status app is 1 to 32 of [A-Za-z0-9_.+-]"
+    );
+    let state = match status {
+        ProgramStatus::Idle => "idle",
+        ProgramStatus::Working => "working",
+        ProgramStatus::Done => "done",
+        ProgramStatus::Blocked(Blocker::Auth) => "blocked:kind=auth",
+        ProgramStatus::Error => "error",
+    };
+    write!(bytes, "\x1b]7501;state={state}:app={app}\x1b\\").expect("writing to a Vec cannot fail");
+}
 
 pub(crate) fn copy_to_clipboard(bytes: &mut Vec<u8>, text: &str) {
     bytes.extend_from_slice(b"\x1b]52;c;");

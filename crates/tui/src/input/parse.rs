@@ -23,6 +23,7 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 const OSC_BELL: &[u8] = b"\x07";
 const STRING_TERMINATOR: &[u8] = b"\x1b\\";
 const BACKGROUND_REPORT: &[u8] = b"11;";
+const PROGRAM_STATUS_REPLY: &[u8] = b"7501;?";
 const LUMINANCE_WEIGHTS: [f64; 3] = [0.2126, 0.7152, 0.0722];
 const PRIVATE_USE_KEYPAD: std::ops::RangeInclusive<u32> = 57399..=57427;
 
@@ -164,6 +165,10 @@ fn parse_osc(buffer: &[u8]) -> Outcome {
     } else {
         return Ok(None);
     };
+    if body[2..].starts_with(PROGRAM_STATUS_REPLY) {
+        crate::terminal::PROGRAM_STATUS.store(true, std::sync::atomic::Ordering::Release);
+        return Ok(Some(Parsed::Reply));
+    }
     match body[2..].strip_prefix(BACKGROUND_REPORT) {
         Some(color) => {
             parse_background(color).map(|scheme| Some(Parsed::Event(Event::ColorScheme(scheme))))

@@ -31,7 +31,7 @@ use nanocode_tui::{
     queue::{Queue, QueueKind, QueueState, QueuedPrompt},
     scheduler::RenderScheduler,
     spinner::{LABEL_TICK, Spinner},
-    terminal::{SelectionEvent, TerminalSession},
+    terminal::{Blocker, ProgramStatus, SelectionEvent, TerminalSession},
     theme::Theme,
     transcript::{CellKind, NoticeLevel, ToolStatus, Transcript, TranscriptPolicy},
     tree::{AgentTree, NodeStatus},
@@ -61,6 +61,7 @@ pub const QUIT_CONFIRMATION: Duration = Duration::from_secs(2);
 pub const AUTOSCROLL_STEP: Duration = Duration::from_millis(50);
 pub const TOOL_PREVIEW_LINES: usize = 6;
 pub const DIFF_PREVIEW_LINES: usize = 40;
+const PROGRAM_STATUS_APP: &str = "nanocode";
 
 pub enum AppEvent {
     Reload,
@@ -220,6 +221,13 @@ pub enum TurnState {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Unseen {
+    Nothing,
+    Done,
+    Failed,
+}
+
 pub enum PickerPurpose {
     Model(models::Choices),
     Harness,
@@ -309,6 +317,7 @@ pub struct App {
     thinking_override: Option<Thinking>,
     tier_override: Option<ServiceTier>,
     awaiting_terminal: bool,
+    pub(crate) unseen: Unseen,
     computer_use_notice: Option<String>,
     pub(crate) google_codes: Option<nanocode_sync::mpsc::WeakUnboundedSender<String>>,
     pub(crate) session_started: bool,
@@ -653,6 +662,7 @@ impl App {
             if let Some(at) = self.autoscroll_at {
                 scheduler.request_at(at);
             }
+            terminal.report_status(PROGRAM_STATUS_APP, self.program_status())?;
             let deadline = scheduler.deadline();
             nanocode_sync::select! {
                 event = input.next() => {
@@ -757,6 +767,24 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn program_status(&self) -> ProgramStatus {
+        if self
+            .google_codes
+            .as_ref()
+            .is_some_and(|codes| codes.upgrade().is_some())
+        {
+            return ProgramStatus::Blocked(Blocker::Auth);
+        }
+        if self.animating() {
+            return ProgramStatus::Working;
+        }
+        match self.unseen {
+            Unseen::Nothing => ProgramStatus::Idle,
+            Unseen::Done => ProgramStatus::Done,
+            Unseen::Failed => ProgramStatus::Error,
+        }
     }
 
     fn animating(&self) -> bool {
@@ -915,6 +943,11 @@ impl App {
                     return Redraw::None;
                 }
                 self.turn = TurnState::Idle;
+                self.unseen = match (&result, self.interrupting) {
+                    (_, true) => Unseen::Nothing,
+                    (Ok(_), false) => Unseen::Done,
+                    (Err(_), false) => Unseen::Failed,
+                };
                 if std::mem::take(&mut self.resuming) && result.is_err() && !self.interrupting {
                     self.hold_after_failed_resume();
                 }
@@ -1817,6 +1850,7 @@ impl App {
     fn handle_terminal(&mut self, event: Event, terminal: &mut TerminalSession) -> bool {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
+                self.unseen = Unseen::Nothing;
                 self.handle_key(key, terminal);
                 if let Some((text, copied)) = self.pending_copy.take() {
                     match terminal.copy(&text) {

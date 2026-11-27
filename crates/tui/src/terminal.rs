@@ -32,6 +32,7 @@ pub use device::{Tty, disable_raw_mode, enable_raw_mode, raw_mode_enabled, size,
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static MODES: AtomicU8 = AtomicU8::new(0);
 static PANIC_HOOK: Once = Once::new();
+pub(crate) static PROGRAM_STATUS: AtomicBool = AtomicBool::new(false);
 
 const MOUSE: u8 = 1;
 const KEYBOARD: u8 = 2;
@@ -100,6 +101,20 @@ pub struct FrameStats {
     pub bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramStatus {
+    Idle,
+    Working,
+    Done,
+    Blocked(Blocker),
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Blocker {
+    Auth,
+}
+
 #[derive(Debug)]
 pub enum SelectionEvent {
     Ignored,
@@ -125,6 +140,7 @@ pub struct TerminalSession {
     selection: Option<Selection>,
     changed: Vec<usize>,
     scrollback: Vec<Line<'static>>,
+    status: Option<ProgramStatus>,
 }
 
 impl TerminalSession {
@@ -160,6 +176,7 @@ impl TerminalSession {
             selection: None,
             changed: Vec::new(),
             scrollback: Vec::new(),
+            status: None,
         })
     }
 
@@ -479,6 +496,16 @@ impl TerminalSession {
         execute(&mut self.output, &bytes)
     }
 
+    pub fn report_status(&mut self, app: &str, status: ProgramStatus) -> io::Result<()> {
+        if !PROGRAM_STATUS.load(Ordering::Acquire) || self.status == Some(status) {
+            return Ok(());
+        }
+        self.status = Some(status);
+        let mut bytes = Vec::new();
+        ansi::program_status(&mut bytes, app, status);
+        execute(&mut self.output, &bytes)
+    }
+
     #[must_use]
     pub const fn mouse_capture(&self) -> bool {
         self.options.mouse_capture
@@ -789,6 +816,7 @@ fn activate(output: &mut impl Write, options: TerminalOptions) -> io::Result<()>
         ansi::ENABLE_COLOR_SCHEME_UPDATES,
         ansi::QUERY_BACKGROUND_COLOR,
         ansi::QUERY_COLOR_SCHEME,
+        ansi::QUERY_PROGRAM_STATUS,
     ] {
         output.write_all(sequence.as_bytes())?;
     }
@@ -818,6 +846,9 @@ fn restore(output: &mut impl Write) {
     }
     #[cfg(unix)]
     bytes.extend_from_slice(ansi::DISABLE_COLOR_SCHEME_UPDATES.as_bytes());
+    if PROGRAM_STATUS.load(Ordering::Acquire) {
+        bytes.extend_from_slice(ansi::CLEAR_PROGRAM_STATUS.as_bytes());
+    }
     for sequence in [ansi::END_SYNCHRONIZED_UPDATE, ansi::DISABLE_BRACKETED_PASTE] {
         bytes.extend_from_slice(sequence.as_bytes());
     }
