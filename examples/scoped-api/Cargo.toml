@@ -21,6 +21,7 @@ nanocode-durability-core.workspace = true
 nanocode-executor.workspace = true
 nanocode-io.workspace = true
 nanocode-partitions.workspace = true
+nanocode-scope.workspace = true
 nanocode-store-sql = { path = "../../crates/integrations/store-sql" }
 nanocode-sync.workspace = true
 nanocode-turnlog.workspace = true

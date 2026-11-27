@@ -10,6 +10,7 @@ const OPENS_SKIPPED: &[&str] = &[
     "crates/runtime/scope",
     "crates/core/turnlog/src/adopt.rs",
     "crates/core/turnlog/src/parted",
+    "crates/integrations/store-sql/examples/plog.rs",
     "bin/nanocode-sim",
 ];
 const SKIPPED_DIRS: &[&str] = &["target", "output", "node_modules"];

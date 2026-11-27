@@ -699,6 +699,7 @@ dependencies = [
  "nanocode-durability-core",
  "nanocode-executor",
  "nanocode-partitions",
+ "nanocode-scope",
  "nanocode-store-sql",
  "nanocode-turnlog",
 ]
@@ -1184,6 +1185,7 @@ dependencies = [
  "nanocode-executor",
  "nanocode-io",
  "nanocode-partitions",
+ "nanocode-scope",
  "nanocode-store-sql",
  "nanocode-sync",
  "nanocode-turnlog",

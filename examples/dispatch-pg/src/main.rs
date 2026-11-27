@@ -23,6 +23,7 @@ use nanocode_dispatch::{Agent, AgentPhase, Budgets, Policy, Role};
 use nanocode_dispatcher::{BRIEF, Dispatcher, Pool, PoolError, PoolFuture, Start};
 use nanocode_durability_core::{Sql, SqlDialect, SqlRow, SqlStatement, StoreError, StoreFuture};
 use nanocode_partitions::Partition;
+use nanocode_scope::{Leases, PartedLeases};
 use nanocode_store_sql::{PgOptions, PgPool, PgSql};
 use nanocode_turnlog::{
     LogHost,
@@ -33,6 +34,8 @@ const OWNER: &str = "agent:lead";
 const POSTER: &str = "agent:lead+poster";
 const SCOPE: &str = "board";
 const LEASE_MS: u64 = 3_600_000;
+const NODE: &str = "bench";
+const RUN_LEASE_MS: u64 = u64::MAX / 4;
 const STEP_MS: u64 = 50;
 
 /// Counts transactions, each one pipelined round trip on PgSql.
@@ -184,7 +187,8 @@ fn main() -> std::process::ExitCode {
     let Some(one) = NonZeroU32::new(1) else {
         return fail("one partition");
     };
-    let log = Arc::new(PartedLog::fenced(Arc::clone(&store), one, "bench"));
+    let log = Arc::new(PartedLog::fenced(Arc::clone(&store), one, NODE));
+    let leases = PartedLeases::new(Arc::clone(&log), NODE, RUN_LEASE_MS);
     let host: Arc<dyn LogHost> = log.clone();
     let policy = Policy {
         roles: vec![Role {
@@ -209,7 +213,7 @@ fn main() -> std::process::ExitCode {
     };
     let result = runtime.block_on(async {
         log.migrate().await.map_err(|error| format!("{error}"))?;
-        log.claim(Partition(0), u64::MAX / 4)
+        Leases::claim(&leases, Partition(0))
             .await
             .map_err(|error| format!("{error}"))?;
         let shown = |error: nanocode_board::BoardError| format!("{error:?}");

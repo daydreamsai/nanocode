@@ -11,6 +11,7 @@ use std::{
 use nanocode_durability_core::{Sql, SqlStatement, StoreError};
 use nanocode_executor::{TcpListener, sleep, spawn, timeout};
 use nanocode_partitions::{Member, Partition, Row, live, plan};
+use nanocode_scope::{Leases, PartedLeases};
 use nanocode_store_sql::PgSql;
 use nanocode_sync::{Atom, Map, Slot, future::join_all, mpsc, oneshot};
 use nanocode_turnlog::parted::{Append, PartStore, PartedLog, SqlParts, Verdict};
@@ -247,6 +248,7 @@ impl Peer {
 pub struct Shared {
     me: String,
     log: Arc<Log>,
+    leases: PartedLeases<SqlParts<PgSql>>,
     sql: Arc<PgSql>,
     data: Arc<SqlParts<PgSql>>,
     settings: Settings,
@@ -269,9 +271,11 @@ pub async fn serve(stores: Stores, settings: Settings) -> Result<(), String> {
         .await
         .map_err(|error| format!("bind {}: {error}", settings.listen))?;
     let (commands, received) = mpsc::channel(settings.queue);
+    let leases = PartedLeases::new(Arc::clone(&stores.log), &settings.listen, settings.lease_ms);
     let shared = Arc::new(Shared {
         me: settings.listen.clone(),
         log: stores.log,
+        leases,
         sql: stores.members,
         data: stores.data,
         settings,
@@ -888,11 +892,7 @@ async fn claim(shared: &Arc<Shared>, part: Partition, now: u64) {
     if !row.claimable(&shared.me, now, shared.settings.grace_ms) {
         return;
     }
-    match shared
-        .log
-        .claim(part, shared.settings.lease_ms)
-        .await
-    {
+    match Leases::claim(&shared.leases, part).await {
         Ok(epoch) => {
             Counters::bump(&shared.counters.claims);
             let owner = start(shared, part, epoch);
@@ -917,7 +917,7 @@ async fn renew(shared: Arc<Shared>) {
     loop {
         let round = Instant::now();
         loop {
-            match timeout(bound, shared.log.renew_all(shared.settings.lease_ms)).await {
+            match timeout(bound, Leases::renew(&shared.leases)).await {
                 Ok(Ok(lost)) => {
                     for part in lost {
                         Counters::bump(&shared.counters.renew_failures);
@@ -956,7 +956,7 @@ async fn release(shared: &Shared, part: Partition) {
             return Counters::bump(&shared.counters.store_errors);
         }
     }
-    match shared.log.release(part).await {
+    match Leases::release(&shared.leases, part).await {
         Ok(()) => Counters::bump(&shared.counters.releases),
         Err(error) => shared.counters.store(&error),
     }
