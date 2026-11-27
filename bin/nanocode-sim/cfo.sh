@@ -479,6 +479,7 @@ default_table='
 1 canary_scope_flush_skips_staged canary:16 --scenario scope --mutation flush_skips_staged
 1 canary_scope_rider_split canary:16 --scenario scope --mutation rider_split
 1 canary_scope_meter_skips_writer_task canary:16 --scenario scope --mutation meter_skips_writer_task
+1 canary_scope_routes_past_expiry canary:16 --scenario scope --mutation routes_past_expiry
 4 admission pass --scenario admission
 1 admission_twice pass --scenario admission --twice
 1 canary_admission_admission_unbounded canary:8 --scenario admission --mutation admission_unbounded

@@ -548,11 +548,14 @@ impl<F: Resident> Inner<F> {
 
     async fn claim(&self, scope: &str, part: Partition) -> Result<Result<u64, String>, ScopeError> {
         let row = self.leases.row(part).await?;
-        let other = match &row {
-            Row::Held { holder, .. } if holder != self.leases.node() => Some(holder.clone()),
-            Row::Held { .. } | Row::Released { .. } => None,
+        let (other, live) = match &row {
+            Row::Held {
+                holder, expires_at, ..
+            } if holder != self.leases.node() => (Some(holder.clone()), self.live(*expires_at)),
+            Row::Held { .. } | Row::Released { .. } => (None, false),
         };
         if let Some(holder) = &other
+            && live
             && !self.unreachable.read(|missed| missed.contains(holder))
         {
             return Ok(Err(holder.clone()));
@@ -576,6 +579,10 @@ impl<F: Resident> Inner<F> {
                 Err(error)
             }
         }
+    }
+
+    fn live(&self, expires_at: u64) -> bool {
+        sim::mutated(Mutation::RoutesPastExpiry) || (self.clock)() <= expires_at
     }
 
     async fn load(

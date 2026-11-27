@@ -818,12 +818,37 @@ fn send(rng: &mut Rng, world: &World, nodes: &mut [Node], stats: &mut ScopeStats
             }
             Ok(Reached::Routed(routed)) => {
                 stats.routed += 1;
+                routed_live(world, node, &scope, routed.holder());
                 forwarded(world, &scope, &routed, command)
             }
         };
     match sent {
         Ok(_) => stats.committed += 1,
         Err(_) => stats.refused += 1,
+    }
+}
+
+fn routed_live(world: &World, node: &Node, scope: &str, holder: &str) {
+    if node.paused {
+        return;
+    }
+    let part = world.reader.partition(scope);
+    let now = world.db.load(Ordering::Relaxed);
+    if let Some(Row::Held {
+        holder: held,
+        expires_at,
+        ..
+    }) = world.store.fence_row(part)
+        && held == holder
+        && expires_at + GRACE_MS < now
+    {
+        flag(
+            &world.wrong,
+            format!(
+                "lease: {} routed {scope} to {holder}, whose lease expired at {expires_at} with {GRACE_MS} ms grace, before the database clock's {now}",
+                node.name
+            ),
+        );
     }
 }
 

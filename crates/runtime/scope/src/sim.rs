@@ -21,10 +21,11 @@ pub enum Mutation {
     MeterSkipsWriterTask,
     AdmissionUnbounded,
     ColdLoadDuplicated,
+    RoutesPastExpiry,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::CheckpointIndexesOnly,
         Self::ReadThroughWriter,
         Self::PublishBeforeCommit,
@@ -39,6 +40,7 @@ impl Mutation {
         Self::FlushSkipsStaged,
         Self::RiderSplit,
         Self::MeterSkipsWriterTask,
+        Self::RoutesPastExpiry,
     ];
 
     pub const ADMISSION: [Self; 3] = [
@@ -68,6 +70,7 @@ impl Mutation {
             Self::MeterSkipsWriterTask => "meter_skips_writer_task",
             Self::AdmissionUnbounded => "admission_unbounded",
             Self::ColdLoadDuplicated => "cold_load_duplicated",
+            Self::RoutesPastExpiry => "routes_past_expiry",
         }
     }
 
