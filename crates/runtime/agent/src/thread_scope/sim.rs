@@ -36,6 +36,7 @@ pub enum Mutation {
     ResidentDropsBlob,
     LegacyOpenClaims,
     CacheDueIgnoresBlob,
+    ClaimSkipsRow,
 }
 
 impl Mutation {
@@ -104,6 +105,7 @@ impl Mutation {
             Self::ResidentDropsBlob => "resident_drops_blob",
             Self::LegacyOpenClaims => "legacy_open_claims",
             Self::CacheDueIgnoresBlob => "cache_due_ignores_blob",
+            Self::ClaimSkipsRow => "claim_skips_row",
         }
     }
 

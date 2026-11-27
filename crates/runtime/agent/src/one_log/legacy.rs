@@ -4,7 +4,10 @@ use nanocode_sync::Atom;
 use nanocode_turnlog::{Effects, Follower, LogHost};
 
 use super::{OneLog, Policy};
-use crate::{durability::StoreError, thread_scope::ThreadLogs};
+use crate::{
+    durability::StoreError,
+    thread_scope::{ThreadLogs, sim},
+};
 
 pub(crate) async fn writer(
     logs: &ThreadLogs,
@@ -27,4 +30,11 @@ pub async fn open(
 
 pub async fn claim(follower: Follower, policy: Policy) -> Result<Arc<OneLog>, StoreError> {
     OneLog::opened(nanocode_turnlog::legacy::claim(follower).await?, policy).await
+}
+
+pub(crate) async fn claimed(log: &OneLog) -> Result<(), StoreError> {
+    if sim::mutated(sim::Mutation::ClaimSkipsRow) {
+        return Ok(());
+    }
+    nanocode_turnlog::legacy::claimed(&log.log).await
 }

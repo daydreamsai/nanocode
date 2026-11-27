@@ -616,6 +616,16 @@ impl OneLogOver {
         self.journals.clone()
     }
 
+    pub async fn claim(&self) -> Result<(), StoreError> {
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(_) => Ok(()),
+                Serving::Legacy(old) => legacy::claimed(&old.log).await,
+            }
+        })
+        .await
+    }
+
     pub async fn served_store(&self) -> Result<ServedStore, StoreError> {
         Ok(match self.fresh().await? {
             Serving::Resident(_) => ServedStore::Resident(self.store.clone()),

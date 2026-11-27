@@ -14,3 +14,7 @@ pub async fn open(
 pub async fn claim(follower: Follower) -> Result<TurnLog, StoreError> {
     follower.claim().await
 }
+
+pub async fn claimed(log: &TurnLog) -> Result<(), StoreError> {
+    log.write(|writing| Box::pin(writing.claimed())).await
+}

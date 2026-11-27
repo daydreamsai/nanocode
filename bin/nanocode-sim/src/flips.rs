@@ -25,8 +25,8 @@ use crate::{
     executor::Clock,
     rng::{FNV_OFFSET, Rng, fnv},
     threadcompat, threadlegacy,
-    threadsessions::{self, Sessions},
     threadscope::{Node, PARTS, World, driven, flag, publish, raw},
+    threadsessions::{self, Sessions},
 };
 
 const THREAD: &str = "flips";
@@ -48,14 +48,16 @@ pub enum FlipsMutation {
     FlipOffUnreadable,
     LegacyOpenClaims,
     ResidentDropsBlob,
+    ClaimSkipsRow,
 }
 
 impl FlipsMutation {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::None,
         Self::FlipOffUnreadable,
         Self::LegacyOpenClaims,
         Self::ResidentDropsBlob,
+        Self::ClaimSkipsRow,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -64,6 +66,7 @@ impl FlipsMutation {
             Self::FlipOffUnreadable => "flip_off_unreadable",
             Self::LegacyOpenClaims => "legacy_open_claims",
             Self::ResidentDropsBlob => "resident_drops_blob",
+            Self::ClaimSkipsRow => "claim_skips_row",
         }
     }
 
@@ -73,6 +76,7 @@ impl FlipsMutation {
             Self::FlipOffUnreadable => Mutation::FlipOffUnreadable,
             Self::LegacyOpenClaims => Mutation::LegacyOpenClaims,
             Self::ResidentDropsBlob => Mutation::ResidentDropsBlob,
+            Self::ClaimSkipsRow => Mutation::ClaimSkipsRow,
         }
     }
 
@@ -293,10 +297,45 @@ fn live(run: &Run, rng: &mut Rng, state: TurnState) -> Option<String> {
     live.get(rng.pick(live.len())).map(|id| (*id).clone())
 }
 
+fn claimed(world: &World, run: &Run) -> Option<()> {
+    if run.over.path() != ThreadPath::Legacy {
+        return Some(());
+    }
+    let stale = thread_scope_sim::open(run.node.logs.scopes().legacy(), THREAD, Policy::default());
+    let stale = match driven(world, "a stale old writer", stale)? {
+        Ok(stale) => stale,
+        Err(error) => {
+            failed(world, run, "a stale open", &error);
+            return None;
+        }
+    };
+    if let Err(error) = driven(world, "a flips claim", run.over.claim())? {
+        failed(world, run, "a claim", &error);
+        return None;
+    }
+    let submission = Submission {
+        request_id: format!("stale{}", run.turns),
+        prompt: Prompt::new("a stale writer's turn"),
+        hand: None,
+        metadata: raw(&json!(null)),
+    };
+    match driven(world, "a stale submit", stale.submit(&submission))? {
+        Err(StoreError::Fenced) => Some(()),
+        answer => {
+            flag(
+                &world.wrong,
+                format!("flips: an old writer opened before a claim writes after it: {answer:?}"),
+            );
+            None
+        }
+    }
+}
+
 fn op(rng: &mut Rng, world: &World, run: &mut Run) -> Option<()> {
     let fields = Map::new();
-    match rng.below(4) {
+    match rng.below(5) {
         0 => submit(world, run),
+        4 => claimed(world, run),
         1 => {
             let Some(id) = live(run, rng, TurnState::Queued) else {
                 return submit(world, run);
@@ -661,7 +700,10 @@ fn sessions(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats)
         }
     };
     let Some(logs) = states.facts() else {
-        flag(&world.wrong, "flips: the state store offers no fact log".to_owned());
+        flag(
+            &world.wrong,
+            "flips: the state store offers no fact log".to_owned(),
+        );
         return None;
     };
     let checked = driven(
@@ -697,7 +739,10 @@ fn started(rng: &mut Rng, world: &World) -> Option<Run> {
                 sessions = Some(written);
             }
             Err(error) => {
-                flag(&world.wrong, format!("flips: the old writer's sessions: {error}"));
+                flag(
+                    &world.wrong,
+                    format!("flips: the old writer's sessions: {error}"),
+                );
                 return None;
             }
         }

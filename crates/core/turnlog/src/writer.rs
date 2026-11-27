@@ -2774,7 +2774,7 @@ impl Writing {
         self.writer.floor.is_some()
     }
 
-    async fn claimed(&mut self) -> Result<(), StoreError> {
+    pub(crate) async fn claimed(&mut self) -> Result<(), StoreError> {
         self.writer.live()?;
         let next = self.writer.next;
         self.push(Record::Host {
