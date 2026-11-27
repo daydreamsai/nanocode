@@ -67,6 +67,10 @@ impl LogHost for Counted {
         self.log.call_bound()
     }
 
+    fn read_capacity(&self) -> u32 {
+        self.log.read_capacity()
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

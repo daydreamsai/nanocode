@@ -479,6 +479,10 @@ impl<H: Sql + Send + Sync + ?Sized> SqlParts<H> {
 }
 
 impl<H: Sql + Send + Sync + ?Sized> PartStore for SqlParts<H> {
+    fn read_capacity(&self) -> u32 {
+        self.host.read_capacity()
+    }
+
     fn migrate(&self, count: NonZeroU32) -> StoreFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
             let count = count.get().to_string();

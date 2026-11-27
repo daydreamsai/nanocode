@@ -51,6 +51,10 @@ pub struct Rider<'a> {
 pub trait LogHost: Send + Sync {
     fn call_bound(&self) -> Option<std::time::Duration>;
 
+    fn read_capacity(&self) -> u32 {
+        1
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,
@@ -459,6 +463,10 @@ impl<H: Sql + Send + Sync + ?Sized> LogHost for SqlLog<H> {
         self.host
             .call_bound()
             .and_then(|bound| bound.checked_mul(SQL_TRANSACTIONS_PER_CALL))
+    }
+
+    fn read_capacity(&self) -> u32 {
+        self.host.read_capacity()
     }
 
     fn scan<'a>(

@@ -57,6 +57,10 @@ impl LogHost for Bounded {
         Some(self.within)
     }
 
+    fn read_capacity(&self) -> u32 {
+        self.host.read_capacity()
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

@@ -248,6 +248,10 @@ impl Sql for PgSql {
         )
     }
 
+    fn read_capacity(&self) -> u32 {
+        u32::try_from(self.reads.connections()).expect("a pool's connection count fits in u32")
+    }
+
     fn run<'a>(
         &'a self,
         access: SqlAccess,

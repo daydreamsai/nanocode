@@ -64,6 +64,10 @@ pub trait PartStore: Send + Sync {
     /// runs DDL.
     fn migrate(&self, count: NonZeroU32) -> StoreFuture<'_, Result<(), StoreError>>;
 
+    fn read_capacity(&self) -> u32 {
+        1
+    }
+
     /// Checks that migrate ran for count partitions at this release's format, without DDL.
     fn prepare(&self, count: NonZeroU32) -> StoreFuture<'_, Result<(), StoreError>>;
 
@@ -981,6 +985,10 @@ impl Drop for Leading<'_> {
 impl<S: PartStore + ?Sized> LogHost for PartedLog<S> {
     fn call_bound(&self) -> Option<std::time::Duration> {
         None
+    }
+
+    fn read_capacity(&self) -> u32 {
+        self.store.read_capacity()
     }
 
     fn scan<'a>(

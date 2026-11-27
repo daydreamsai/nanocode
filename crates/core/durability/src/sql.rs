@@ -59,6 +59,10 @@ pub trait Sql: MaybeSend + MaybeSync {
 
     fn call_bound(&self) -> Option<Duration>;
 
+    fn read_capacity(&self) -> u32 {
+        1
+    }
+
     fn run<'a>(
         &'a self,
         access: SqlAccess,
