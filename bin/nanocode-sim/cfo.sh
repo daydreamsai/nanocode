@@ -491,6 +491,7 @@ default_table='
 1 canary_thread_scope_listing_skips_dropped canary:16 --scenario thread_scope --mutation listing_skips_dropped
 1 canary_thread_scope_adoption_skips_retired canary:16 --scenario thread_scope --mutation adoption_skips_retired
 1 canary_thread_scope_adoption_skips_blobs canary:16 --scenario thread_scope --mutation adoption_skips_blobs
+1 canary_thread_scope_resident_drops_blob canary:16 --scenario thread_scope --mutation resident_drops_blob
 1 canary_thread_scope_adoption_skips_checkpoint canary:16 --scenario thread_scope --mutation adoption_skips_checkpoint
 1 canary_thread_scope_job_forwarded canary:16 --scenario thread_scope --mutation job_forwarded
 1 canary_thread_scope_job_rows_dropped canary:16 --scenario thread_scope --mutation job_rows_dropped

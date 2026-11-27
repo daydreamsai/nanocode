@@ -5,8 +5,8 @@ use std::{
 
 use nanocode_scope::Adopted;
 use nanocode_turnlog::{
-    ArmedWake, Checkpoint, Event, Fold, Hold, LogHost, OpenCall, Phase, RETIRED_KEY, Retired,
-    Turn,
+    ArmedWake, CachedAt, Checkpoint, Event, FOLD_SNAPSHOT_KEY, Fold, Hold, LogHost, OpenCall,
+    Phase, RETIRED_KEY, Retired, Turn,
     adopt::{self, Adoption, Reading},
 };
 use serde_json::value::RawValue;
@@ -270,6 +270,51 @@ fn keep(state: &mut ThreadState, view: View) {
     state.generation = view.generation;
 }
 
+fn cached_blobs(view: &View) -> BTreeSet<Digest> {
+    view.hosts
+        .iter()
+        .filter(|(key, _)| {
+            key.strip_prefix(FOLD_SNAPSHOT_KEY)
+                .is_some_and(|rest| rest.starts_with('\n'))
+        })
+        .filter_map(|(_, value)| serde_json::from_str::<CachedAt>(value.get()).ok())
+        .map(|at| at.blob)
+        .collect()
+}
+
+async fn bodies(
+    legacy: &Adoption,
+    state: &mut ThreadState,
+    cached: &BTreeSet<Digest>,
+) -> Result<(), StoreError> {
+    let named: BTreeSet<Digest> = state.blobs.iter().chain(cached).copied().collect();
+    let wanted: Vec<Digest> = named
+        .into_iter()
+        .filter(|digest| !(cached.contains(digest) && sim::mutated(Mutation::ResidentDropsBlob)))
+        .filter(|digest| state.blob_body(digest).is_none())
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let resolved = legacy.blobs(&wanted).await?;
+    for digest in &wanted {
+        let Some(json) = resolved.get(digest) else {
+            return Err(invalid(format!(
+                "blob {} is missing from the turn log",
+                digest.key().as_str()
+            )));
+        };
+        state
+            .stored
+            .insert(Arc::from(digest.key().as_str()), Arc::from(json.get()));
+    }
+    assert!(
+        wanted.iter().all(|digest| state.blob_body(digest).is_some()),
+        "an adopted thread holds the body of every blob it resolved"
+    );
+    Ok(())
+}
+
 async fn values(
     legacy: &Adoption,
     digests: &[(BlobRef, Option<Digest>)],
@@ -391,7 +436,9 @@ pub(super) async fn adopt(
     turns(&mut state, &mut view, &history)?;
     events(&history, last_event)?;
     facts(&mut state, &read)?;
+    let cached = cached_blobs(&view);
     keep(&mut state, view);
+    bodies(&legacy, &mut state, &cached).await?;
     state.last_event = last_event;
     state.legacy = Some(Legacy {
         next,

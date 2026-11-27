@@ -31,10 +31,11 @@ pub enum Mutation {
     FlipOffUnreadable,
     TailUnbounded,
     OpenPerRequest,
+    ResidentDropsBlob,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::PartDropped,
         Self::AdoptionSkipsRetired,
         Self::AdoptionSkipsBlobs,
@@ -61,6 +62,7 @@ impl Mutation {
         Self::ScopeStartsAtRowZero,
         Self::TailUnbounded,
         Self::OpenPerRequest,
+        Self::ResidentDropsBlob,
     ];
 
     #[must_use]
@@ -94,6 +96,7 @@ impl Mutation {
             Self::FlipOffUnreadable => "flip_off_unreadable",
             Self::TailUnbounded => "tail_unbounded",
             Self::OpenPerRequest => "open_per_request",
+            Self::ResidentDropsBlob => "resident_drops_blob",
         }
     }
 

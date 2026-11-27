@@ -43,6 +43,7 @@ use crate::{
     executor::Clock,
     rng::{FNV_OFFSET, Rng, fnv},
     threadlegacy::{self, Legacy, View},
+    threadsessions::{self, Sessions},
 };
 
 pub(crate) const PARTS: u32 = 2;
@@ -66,6 +67,8 @@ const RELEASE_PPM: u64 = 40_000;
 const CRASH_PPM: u64 = 12_000;
 const TICK_PPM: u64 = 120_000;
 const LEGACY_PPM: u64 = 500_000;
+const SESSIONS_PPM: u64 = 500_000;
+const SESSION_CHECK_PPM: u64 = 300_000;
 const JOB_PPM: u64 = 150_000;
 const FACT_LOG_PPM: u64 = 100_000;
 const FACT_BLOB_PPM: u64 = 300_000;
@@ -180,6 +183,13 @@ pub struct ThreadScopeStats {
     pub compat_flips: u64,
     pub compat_adoptions: u64,
     pub compat_commands: u64,
+    pub session_threads: u64,
+    pub session_turns: u64,
+    pub session_turns_max: u64,
+    pub session_bytes_max: u64,
+    pub session_checks: u64,
+    pub session_blobs_checked: u64,
+    pub adoption_bytes: u64,
 }
 
 impl ThreadScopeStats {
@@ -237,6 +247,13 @@ impl ThreadScopeStats {
         self.compat_flips += other.compat_flips;
         self.compat_adoptions += other.compat_adoptions;
         self.compat_commands += other.compat_commands;
+        self.session_threads += other.session_threads;
+        self.session_turns += other.session_turns;
+        self.session_turns_max = self.session_turns_max.max(other.session_turns_max);
+        self.session_bytes_max = self.session_bytes_max.max(other.session_bytes_max);
+        self.session_checks += other.session_checks;
+        self.session_blobs_checked += other.session_blobs_checked;
+        self.adoption_bytes += other.adoption_bytes;
     }
 }
 
@@ -299,6 +316,7 @@ pub(crate) struct World {
     count: NonZeroU32,
     threads: Vec<String>,
     legacy: BTreeMap<String, (Legacy, View)>,
+    sessions: RefCell<BTreeMap<String, Sessions>>,
     bases: RefCell<BTreeMap<String, (u64, ThreadState)>>,
     answered: RefCell<BTreeMap<String, BTreeMap<u64, String>>>,
     notes: Cell<u64>,
@@ -821,6 +839,10 @@ fn send(
     };
     if log.state().is_some() {
         adopted(world, &thread, stats);
+        if sessions(world, &thread, &log, stats) && rng.chance(SESSION_CHECK_PPM) {
+            agrees(rng, world, log, &thread, stats);
+            return None;
+        }
     }
     if rng.chance(FACT_LOG_PPM) {
         fact_log(rng, world, log, &thread, stats);
@@ -1067,6 +1089,88 @@ fn adopted(world: &World, thread: &str, stats: &mut ThreadScopeStats) {
         .insert(thread.to_owned(), (first.seq, state));
 }
 
+fn sessions(world: &World, thread: &str, log: &ThreadLog, stats: &mut ThreadScopeStats) -> bool {
+    if !session_base(world, thread) {
+        return false;
+    }
+    let Some(state) = log.state() else {
+        return false;
+    };
+    held(world, thread, &state, stats)
+}
+
+fn session_base(world: &World, thread: &str) -> bool {
+    let Some(next) = world.sessions.borrow().get(thread).map(|sessions| sessions.next) else {
+        return false;
+    };
+    if !world.bases.borrow().contains_key(thread) {
+        let Some(first) = world.witness.manifests(thread).first().cloned() else {
+            flag(
+                &world.wrong,
+                format!("{thread} was claimed over its old writer's sessions with no checkpoint after them"),
+            );
+            return false;
+        };
+        if first.seq != next {
+            flag(
+                &world.wrong,
+                format!(
+                    "the first checkpoint of {thread} is at row {}, not at its old writer's head {next}",
+                    first.seq
+                ),
+            );
+            return false;
+        }
+        match decoded(world, &first) {
+            Ok(state) => {
+                world
+                    .bases
+                    .borrow_mut()
+                    .insert(thread.to_owned(), (first.seq, state));
+            }
+            Err(error) => {
+                flag(&world.wrong, format!("the adopted checkpoint of {thread} does not decode: {error}"));
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn held(world: &World, thread: &str, state: &ThreadState, stats: &mut ThreadScopeStats) -> bool {
+    let sessions = world.sessions.borrow();
+    let Some(sessions) = sessions.get(thread) else {
+        return false;
+    };
+    match threadsessions::held(state, thread, sessions) {
+        Ok(checked) => {
+            stats.session_blobs_checked += checked;
+            true
+        }
+        Err(error) => {
+            flag(&world.wrong, format!("sessions: {error}"));
+            false
+        }
+    }
+}
+
+fn agrees(rng: &mut Rng, world: &World, log: ThreadLog, thread: &str, stats: &mut ThreadScopeStats) {
+    let Some(mut sessions) = world.sessions.borrow_mut().remove(thread) else {
+        return;
+    };
+    let checked = driven(
+        world,
+        "a session fold",
+        threadsessions::agrees(rng, log, thread, &mut sessions),
+    );
+    world.sessions.borrow_mut().insert(thread.to_owned(), sessions);
+    match checked {
+        Some(Ok(checked)) => stats.session_checks += checked,
+        Some(Err(error)) => flag(&world.wrong, format!("sessions: {error}")),
+        None => {}
+    }
+}
+
 fn records(rows: &[(u64, String)], from: u64, to: u64) -> Vec<Record> {
     rows.iter()
         .filter(|(seq, _)| (from..to).contains(seq))
@@ -1192,12 +1296,16 @@ fn colds(world: &World, stats: &mut ThreadScopeStats) {
     for thread in &world.threads {
         if !world.witness.manifests(thread).is_empty() {
             adopted(world, thread, stats);
+            session_base(world, thread);
         }
         renumbered(world, thread);
         let Some(loaded) = cold(world, thread, stats) else {
             continue;
         };
         stats.cold_checks += 1;
+        if let Ok(loaded) = &loaded {
+            held(world, thread, loaded, stats);
+        }
         let refold = world.refold(thread, &world.rows(thread));
         match (loaded, refold) {
             (Ok(loaded), Ok(refold)) if loaded.digest() == refold.digest() => {}
@@ -1232,7 +1340,7 @@ fn phase(phase: &Phase) -> &'static str {
 
 fn legacy(world: &World, stats: &mut ThreadScopeStats) {
     for thread in &world.threads {
-        if world.legacy.contains_key(thread) {
+        if world.legacy.contains_key(thread) || world.sessions.borrow().contains_key(thread) {
             continue;
         }
         let rows = world.rows(thread);
@@ -1464,6 +1572,7 @@ pub(crate) fn world(rng: &mut Rng, time: &Arc<Clock>) -> World {
             .map(|at| format!("thread-{at}"))
             .collect(),
         legacy: BTreeMap::new(),
+        sessions: RefCell::default(),
         bases: RefCell::default(),
         answered: RefCell::default(),
         notes: Cell::new(0),
@@ -1472,10 +1581,32 @@ pub(crate) fn world(rng: &mut Rng, time: &Arc<Clock>) -> World {
     }
 }
 
+fn session_history(rng: &mut Rng, world: &World, host: &Arc<dyn LogHost>, thread: &str, stats: &mut ThreadScopeStats) {
+    let written = driven(
+        world,
+        "an old writer's sessions",
+        threadsessions::write(rng, Arc::clone(host), thread),
+    );
+    match written {
+        Some(Ok(sessions)) => {
+            stats.session_threads += 1;
+            stats.session_turns += sessions.turns;
+            stats.session_turns_max = stats.session_turns_max.max(sessions.turns);
+            stats.session_bytes_max = stats.session_bytes_max.max(sessions.bytes);
+            world.sessions.borrow_mut().insert(thread.to_owned(), sessions);
+        }
+        Some(Err(error)) => flag(&world.wrong, format!("the old writer's sessions of {thread}: {error}")),
+        None => {}
+    }
+}
+
 fn history(rng: &mut Rng, world: &mut World, stats: &mut ThreadScopeStats) {
     let host: Arc<dyn LogHost> = Arc::new(PartedLog::new(Arc::clone(&world.store), world.count));
     for thread in world.threads.clone() {
         if !rng.chance(LEGACY_PPM) {
+            if rng.chance(SESSIONS_PPM) {
+                session_history(rng, world, &host, &thread, stats);
+            }
             continue;
         }
         let written = driven(
@@ -1640,6 +1771,7 @@ fn seeded(seed: u64, mutation: ThreadScopeMutation, time: &Arc<Clock>) -> Outcom
         let runtime = node.logs.scopes().stats();
         stats.adoptions += runtime.adoptions;
         stats.adoption_rows += runtime.adoption_rows;
+        stats.adoption_bytes += runtime.adoption_bytes;
         stats.loads += runtime.loads;
         stats.load_rows_max = stats.load_rows_max.max(runtime.load_rows_max);
         stats.checkpoints += runtime.checkpoints;
@@ -1648,12 +1780,12 @@ fn seeded(seed: u64, mutation: ThreadScopeMutation, time: &Arc<Clock>) -> Outcom
         stats.evictions += runtime.evictions;
         stats.forwards += runtime.forwards;
     }
-    if stats.adoptions > world.legacy.len() as u64 {
+    let histories = world.legacy.len() + world.sessions.borrow().len();
+    if stats.adoptions > histories as u64 {
         flag(
             &world.wrong,
             format!(
-                "{} turn log histories were adopted {} times; a claim after the first read the history again",
-                world.legacy.len(),
+                "{histories} turn log histories were adopted {} times; a claim after the first read the history again",
                 stats.adoptions
             ),
         );
