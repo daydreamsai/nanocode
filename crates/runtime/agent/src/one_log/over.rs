@@ -371,7 +371,9 @@ impl OneLogOver {
                 Serving::Legacy(self.old(Some(bound)).await?)
             }
             (Serving::Legacy(old), ThreadPath::Resident)
-                if old.adopting && self.logs.scopes().adopting(&self.thread) =>
+                if old.adopting
+                    && (self.logs.scopes().adopting(&self.thread)
+                        || sim::mutated(sim::Mutation::AdoptedServesLegacy)) =>
             {
                 return Ok(serving);
             }

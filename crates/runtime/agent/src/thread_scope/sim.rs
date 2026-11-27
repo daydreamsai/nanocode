@@ -38,6 +38,7 @@ pub enum Mutation {
     CacheDueIgnoresBlob,
     ClaimSkipsRow,
     AdoptionKeepsHistory,
+    AdoptedServesLegacy,
 }
 
 impl Mutation {
@@ -109,6 +110,7 @@ impl Mutation {
             Self::CacheDueIgnoresBlob => "cache_due_ignores_blob",
             Self::ClaimSkipsRow => "claim_skips_row",
             Self::AdoptionKeepsHistory => "adoption_keeps_history",
+            Self::AdoptedServesLegacy => "adopted_serves_legacy",
         }
     }
 

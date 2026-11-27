@@ -41,6 +41,9 @@ const SESSIONS_PPM: u64 = 500_000;
 const RECENT_ROWS: usize = 1 << 16;
 const DRIVEN: [&str; 2] = ["thread_path", "row_format"];
 const RESTARTS: u64 = 2 * ROUNDS.end;
+const QUIET_PASSES: u64 = 2;
+const SNAPSHOT_PPM: u64 = 750_000;
+const SNAPSHOT_ROWS: Range<u64> = 2..8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlipsMutation {
@@ -49,15 +52,17 @@ pub enum FlipsMutation {
     LegacyOpenClaims,
     ResidentDropsBlob,
     ClaimSkipsRow,
+    AdoptedServesLegacy,
 }
 
 impl FlipsMutation {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::None,
         Self::FlipOffUnreadable,
         Self::LegacyOpenClaims,
         Self::ResidentDropsBlob,
         Self::ClaimSkipsRow,
+        Self::AdoptedServesLegacy,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -67,6 +72,7 @@ impl FlipsMutation {
             Self::LegacyOpenClaims => "legacy_open_claims",
             Self::ResidentDropsBlob => "resident_drops_blob",
             Self::ClaimSkipsRow => "claim_skips_row",
+            Self::AdoptedServesLegacy => "adopted_serves_legacy",
         }
     }
 
@@ -77,6 +83,7 @@ impl FlipsMutation {
             Self::LegacyOpenClaims => Mutation::LegacyOpenClaims,
             Self::ResidentDropsBlob => Mutation::ResidentDropsBlob,
             Self::ClaimSkipsRow => Mutation::ClaimSkipsRow,
+            Self::AdoptedServesLegacy => Mutation::AdoptedServesLegacy,
         }
     }
 
@@ -108,6 +115,7 @@ pub struct FlipsStats {
     pub acked: u64,
     pub checked: u64,
     pub sessions: u64,
+    pub held: u64,
 }
 
 impl FlipsStats {
@@ -122,6 +130,7 @@ impl FlipsStats {
         self.acked += other.acked;
         self.checked += other.checked;
         self.sessions += other.sessions;
+        self.held += other.held;
     }
 }
 
@@ -147,6 +156,7 @@ impl Switched {
 
 struct Run {
     paths: Arc<Switched>,
+    policy: Policy,
     node: Node,
     over: Arc<OneLogOver>,
     generation: u64,
@@ -210,19 +220,20 @@ fn registered(world: &World) -> bool {
     true
 }
 
-fn opened(world: &World, node: &Node, paths: &Arc<Switched>) -> Option<Arc<OneLogOver>> {
+fn opened(
+    world: &World,
+    node: &Node,
+    paths: &Arc<Switched>,
+    policy: &Policy,
+) -> Option<Arc<OneLogOver>> {
     let logs = Arc::new(
         node.logs
             .clone()
             .with_paths(Arc::clone(paths) as Arc<dyn ThreadPaths>),
     );
-    let policy = Policy {
-        restarts: RESTARTS,
-        ..Policy::default()
-    };
     let legacy = paths.path(THREAD) == ThreadPath::Legacy;
     let loads = node.logs.scopes().stats().loads;
-    match driven(world, "a flips open", OneLog::over(logs, THREAD, &policy))? {
+    match driven(world, "a flips open", OneLog::over(logs, THREAD, policy))? {
         Ok(_) if legacy && node.logs.scopes().stats().loads != loads => {
             flag(
                 &world.wrong,
@@ -632,7 +643,7 @@ fn moved(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) ->
     if crash {
         missed(world, &node)?;
     }
-    run.over = opened(world, &node, &run.paths)?;
+    run.over = opened(world, &node, &run.paths, &run.policy)?;
     run.node = node;
     let lossy = crash || legacy;
     agree(world, run, lossy, "after a node moved", stats)
@@ -660,11 +671,7 @@ fn round(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) ->
         return None;
     }
     if run.over.path() != to {
-        driven(world, "a flips backfill", run.node.logs.scopes().backfill())?;
-        if let Err(error) = driven(world, "a flips read after its backfill", run.over.pending())? {
-            failed(world, run, "the read after a backfill", &error);
-            return None;
-        }
+        backfilled(world, run, stats)?;
     }
     if run.over.path() != to {
         flag(
@@ -685,6 +692,36 @@ fn round(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) ->
         stats,
     )?;
     sessions(rng, world, run, stats)
+}
+
+fn backfilled(world: &World, run: &Run, stats: &mut FlipsStats) -> Option<()> {
+    stats.held += 1;
+    for _ in 0..QUIET_PASSES {
+        if !run.node.logs.scopes().adopting(THREAD) {
+            flag(
+                &world.wrong,
+                "flips: the facade serves legacy on the resident path with no backfill queued"
+                    .to_owned(),
+            );
+            return None;
+        }
+        let passed = driven(world, "a flips backfill", run.node.logs.scopes().backfill())?;
+        if let Some((scope, error)) = passed.failed.first() {
+            flag(
+                &world.wrong,
+                format!("flips: the backfill of {scope} fails: {error}"),
+            );
+            return None;
+        }
+        if passed.adopted > 0 {
+            break;
+        }
+    }
+    if let Err(error) = driven(world, "a flips read after its backfill", run.over.pending())? {
+        failed(world, run, "the read after a backfill", &error);
+        return None;
+    }
+    Some(())
 }
 
 fn sessions(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) -> Option<()> {
@@ -772,9 +809,18 @@ fn started(rng: &mut Rng, world: &World) -> Option<Run> {
     log_sim::force(Some(row_format(stamped)));
     let node = world.node("f0");
     publish(world, std::slice::from_ref(&node));
-    let over = opened(world, &node, &paths)?;
+    let snapshot_rows = rng
+        .chance(SNAPSHOT_PPM)
+        .then(|| rng.range(SNAPSHOT_ROWS.start, SNAPSHOT_ROWS.end) as usize);
+    let policy = Policy {
+        restarts: RESTARTS,
+        snapshot_rows,
+        ..Policy::default()
+    };
+    let over = opened(world, &node, &paths, &policy)?;
     Some(Run {
         paths,
+        policy,
         node,
         over,
         generation: 0,
