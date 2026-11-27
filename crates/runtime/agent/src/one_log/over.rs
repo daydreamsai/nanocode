@@ -16,12 +16,12 @@ use nanocode_tool_host::{
     hold::{HoldCall, HoldLedger, LedgerError, Running},
 };
 use nanocode_turnlog::{
-    Answer, ArmedWake, EffectClass, Effects, Point, Resumption, SCAN_END, Wake, WakeRider,
+    Answer, ArmedWake, EffectClass, Effects, Fold, Point, Resumption, SCAN_END, Wake, WakeRider,
     adopt::{self, Reading},
 };
 use serde_json::{Map, Value, value::RawValue};
 
-use super::{Exported, Fire, Heard, Imported, OneLog, Policy, WakeError, legacy};
+use super::{Exported, Fire, Heard, Imported, OneLog, OneLogStore, Policy, WakeError, legacy};
 use crate::{
     durability::{StateStore, StoreError, StoreRecord},
     session_log::{LogEntry, LoggedEvent, Started, Submission, Submitted, TurnRecord, TurnState},
@@ -33,6 +33,11 @@ use crate::{
 };
 
 type Answered = Option<(TurnRecord, Option<LoggedEvent>)>;
+
+pub enum ServedStore {
+    Resident(ThreadStore),
+    Legacy(OneLogStore),
+}
 
 pub struct OneLogOver {
     logs: Arc<ThreadLogs>,
@@ -611,11 +616,34 @@ impl OneLogOver {
         self.journals.clone()
     }
 
-    pub async fn states(&self) -> Result<Box<dyn StateStore>, StoreError> {
+    pub async fn served_store(&self) -> Result<ServedStore, StoreError> {
         Ok(match self.fresh().await? {
-            Serving::Resident(_) => Box::new(self.store.clone()),
-            Serving::Legacy(old) => Box::new(old.log.store()),
+            Serving::Resident(_) => ServedStore::Resident(self.store.clone()),
+            Serving::Legacy(old) => ServedStore::Legacy(old.log.store()),
         })
+    }
+
+    pub async fn states(&self) -> Result<Box<dyn StateStore>, StoreError> {
+        Ok(match self.served_store().await? {
+            ServedStore::Resident(store) => Box::new(store),
+            ServedStore::Legacy(store) => Box::new(store),
+        })
+    }
+
+    pub async fn turn_count(&self) -> Result<usize, StoreError> {
+        match self.fresh().await? {
+            Serving::Resident(_) => self.read(|state| state.turns().count()).await,
+            Serving::Legacy(old) => Ok(old.log.read(|fold| fold.turns().len()).await),
+        }
+    }
+
+    pub async fn held_bytes(&self) -> usize {
+        match self.current() {
+            Serving::Resident(_) => self.remembered_bytes(),
+            Serving::Legacy(old) => {
+                old.log.read(Fold::resident_bytes).await + old.log.remembered_bytes()
+            }
+        }
     }
 
     pub async fn sink(&self) -> Result<Arc<dyn CellJournalSink>, StoreError> {

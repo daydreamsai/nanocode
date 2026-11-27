@@ -18,8 +18,8 @@ pub use handoff::{
     Base, Missing, ResumeError, Settled, Unresumable, base_checkpoint, settle_pending,
 };
 pub use one_log::{
-    Exported, Fire, Heard, Imported, OneLog, OneLogJournals, OneLogOver, OneLogStore, Policy, WakeError,
-    facts_sim, import_sim,
+    Exported, Fire, Heard, Imported, OneLog, OneLogJournals, OneLogOver, OneLogStore, Policy,
+    ServedStore, WakeError, facts_sim, import_sim,
 };
 pub use remote::{ChildHost, ChildSpec, ChildToolCall, ChildTurn, RemoteChildren};
 pub use router::{
