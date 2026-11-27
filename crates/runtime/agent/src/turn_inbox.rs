@@ -38,6 +38,7 @@ pub mod sim {
         None,
         OwnedRequestHeld,
         OwnedCancelCloses,
+        PassEndSkipsSteerRead,
     }
 
     static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);
@@ -214,6 +215,16 @@ impl Delivery {
     #[must_use]
     pub fn given(&self) -> Vec<String> {
         self.with(|delivered| delivered != Delivered::Ungiven)
+    }
+
+    fn offer(&mut self, id: &str) {
+        self.0.entry(id.to_owned()).or_insert(Delivered::Ungiven);
+    }
+
+    fn unread(&self) -> Vec<String> {
+        let mut unread = self.with(|delivered| delivered != Delivered::Read);
+        unread.sort_unstable();
+        unread
     }
 
     fn with(&self, keep: impl Fn(Delivered) -> bool) -> Vec<String> {
@@ -1210,6 +1221,12 @@ impl<L: EventLog + ?Sized> TurnInbox<L> {
             }
         }
         self.stop_recording().await;
+        if let Err(error) = self.confirm_reads().await {
+            return PassEnd::Stopped {
+                reason: format!("reading which steers the pass read failed: {error}"),
+                control,
+            };
+        }
         match halt {
             Some(Halt::Stop(reason)) => PassEnd::Stopped { reason, control },
             _ => PassEnd::Left { control },
@@ -1225,11 +1242,32 @@ impl<L: EventLog + ?Sized> TurnInbox<L> {
             self.stop_recording().await;
             return PassEnd::Stopped { reason, control };
         }
+        if let Err(error) = self.confirm_reads().await {
+            return PassEnd::Stopped {
+                reason: format!("reading which steers the pass read failed: {error}"),
+                control,
+            };
+        }
         self.shared.delivery.update(Delivery::ended);
         match value {
             Ok(result) => PassEnd::Completed(result),
             Err(error) => PassEnd::Failed(error),
         }
+    }
+
+    async fn confirm_reads(&self) -> Result<(), NanocodeError> {
+        if sim::mutated(sim::Mutation::PassEndSkipsSteerRead) {
+            return Ok(());
+        }
+        let unread = self.shared.delivery.read(Delivery::unread);
+        let read = self.runtime.steers_read(self.session_id(), &unread).await?;
+        assert!(read.len() <= unread.len());
+        self.shared.delivery.update(|delivery| {
+            for id in &read {
+                assert!(delivery.mark(id, Delivered::Read));
+            }
+        });
+        Ok(())
     }
 
     async fn stop_recording(&self) {
@@ -1239,6 +1277,11 @@ impl<L: EventLog + ?Sized> TurnInbox<L> {
 
     async fn deliver(&self, request_id: &str, control: &TurnControl) -> Result<(), ()> {
         let inputs = self.shared.host.inputs(request_id).await.map_err(drop)?;
+        self.shared.delivery.update(|delivery| {
+            for id in &inputs {
+                delivery.offer(id);
+            }
+        });
         for id in inputs {
             if self
                 .shared

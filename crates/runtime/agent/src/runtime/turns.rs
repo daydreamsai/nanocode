@@ -168,6 +168,28 @@ impl AgentRuntime {
             .map_err(catalog_error)
     }
 
+    pub(crate) async fn steers_read(
+        &self,
+        session_id: &str,
+        message_ids: &[String],
+    ) -> Result<Vec<String>, NanocodeError> {
+        let Some(store) = self.inner.durability.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut read = Vec::with_capacity(message_ids.len());
+        for message_id in message_ids {
+            let answer = store
+                .steer_read(session_id, message_id)
+                .await
+                .map_err(catalog_error)?;
+            if answer == Some(true) {
+                read.push(message_id.clone());
+            }
+        }
+        assert!(read.len() <= message_ids.len());
+        Ok(read)
+    }
+
     pub async fn settle(&self, session_id: &str) -> Result<bool, NanocodeError> {
         let Some(control) = self.delegates() else {
             return Ok(self.pending_turns(session_id).await?.is_empty());
