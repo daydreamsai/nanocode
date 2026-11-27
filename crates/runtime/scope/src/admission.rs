@@ -62,7 +62,10 @@ impl Admission {
             Ok(permit) => permit,
             Err(AcquireError::Busy) => {
                 self.busy.fetch_add(1, Ordering::Relaxed);
-                return Err(E::from(StoreError::Busy));
+                return Err(E::from(StoreError::Unadmitted {
+                    capacity: self.capacity,
+                    admit_ms: self.admit_ms,
+                }));
             }
             Err(AcquireError::Closed) => panic!("the read admission is never closed"),
         };

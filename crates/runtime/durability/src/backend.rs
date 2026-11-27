@@ -69,7 +69,12 @@ pub fn agent_error(error: Error) -> NanocodeError {
         Error::Store(StoreError::NotCommitted(_))
         | Error::OperationBlocked { .. }
         | Error::OperationActive { .. } => ExecutionPolicyDisposition::Retry,
-        Error::Store(StoreError::Fenced | StoreError::Conflict { .. } | StoreError::Backend(_))
+        Error::Store(
+            StoreError::Fenced
+            | StoreError::Unadmitted { .. }
+            | StoreError::Conflict { .. }
+            | StoreError::Backend(_),
+        )
         | Error::ModelOwnerFenced
         | Error::DriverStopped => ExecutionPolicyDisposition::Reopen,
         _ => ExecutionPolicyDisposition::Fatal,

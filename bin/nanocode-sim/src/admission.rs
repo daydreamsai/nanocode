@@ -241,7 +241,7 @@ impl LogHost for Slow {
 #[derive(Clone)]
 enum Got {
     Local(Scope<Sum>),
-    Busy,
+    Busy(StoreError),
     Other(String),
 }
 
@@ -258,8 +258,23 @@ struct World {
     scopes: Scopes<Sum>,
     names: Vec<String>,
     capacity: u64,
+    admit_ms: u64,
     bound_ns: u64,
     wrong: Vec<String>,
+}
+
+impl World {
+    fn refused(&mut self, scope: &str, refusal: &StoreError) {
+        let named = StoreError::Unadmitted {
+            capacity: u32::try_from(self.capacity).expect("a capacity fits"),
+            admit_ms: self.admit_ms,
+        };
+        if *refusal != named {
+            self.wrong.push(format!(
+                "I17: a read of {scope} is refused as {refusal:?}, not as {named:?}"
+            ));
+        }
+    }
 }
 
 fn counted(work: Work) -> (u64, u64, u64) {
@@ -300,7 +315,9 @@ fn gets(world: &World, rng: &mut Rng, stats: &mut AdmissionStats) -> Vec<Ran> {
                     Ok(Reached::Routed(routed)) => {
                         Got::Other(format!("routed to {}", routed.holder()))
                     }
-                    Err(ScopeError::Busy) => Got::Busy,
+                    Err(ScopeError::Store(refusal @ StoreError::Unadmitted { .. })) => {
+                        Got::Busy(refusal)
+                    }
                     Err(error) => Got::Other(error.to_string()),
                 };
                 let ran = Ran {
@@ -360,7 +377,10 @@ fn judge_gets(world: &mut World, answers: &[Ran], stats: &mut AdmissionStats) {
                     ));
                 }
             }
-            Got::Busy => stats.busy += 1,
+            Got::Busy(refusal) => {
+                stats.busy += 1;
+                world.refused(&answer.scope, refusal);
+            }
             Got::Other(other) => world
                 .wrong
                 .push(format!("a cold get of {} answered {other}", answer.scope)),
@@ -373,7 +393,7 @@ fn loaded(answers: &[Ran]) -> BTreeMap<String, Scope<Sum>> {
         .iter()
         .filter_map(|answer| match &answer.got {
             Got::Local(scope) => Some((answer.scope.clone(), scope.clone())),
-            Got::Busy | Got::Other(_) => None,
+            Got::Busy(_) | Got::Other(_) => None,
         })
         .collect()
 }
@@ -450,7 +470,10 @@ fn history(
         stats.history_reads += 1;
         match read {
             Ok(()) => {}
-            Err(StoreError::Busy) => stats.history_busy += 1,
+            Err(refusal @ StoreError::Unadmitted { .. }) => {
+                stats.history_busy += 1;
+                world.refused(&name, &refusal);
+            }
             Err(error) => world
                 .wrong
                 .push(format!("a history read of {name}: {error}")),
@@ -540,6 +563,7 @@ fn world(rng: &mut Rng, clock: &Arc<Clock>) -> World {
         scopes,
         names,
         capacity,
+        admit_ms,
         bound_ns: bound_ms * 1_000_000,
         wrong: Vec::new(),
     }

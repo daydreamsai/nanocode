@@ -74,6 +74,11 @@ pub enum StoreError {
 
     Busy,
 
+    Unadmitted {
+        capacity: u32,
+        admit_ms: u64,
+    },
+
     Conflict {
         expected: u64,
         actual: u64,
@@ -101,6 +106,11 @@ impl std::fmt::Display for StoreError {
         match self {
             Self::Fenced => formatter.write_str("durability state owner was fenced"),
             Self::Busy => formatter.write_str("durability state is held by a live owner"),
+            Self::Unadmitted { capacity, admit_ms } => write!(
+                formatter,
+                "the read waited {admit_ms} ms for one of {capacity} read admissions \
+                 and did not start"
+            ),
             Self::Conflict { expected, actual } => write!(
                 formatter,
                 "durability state revision conflict: expected {expected}, found {actual}"
