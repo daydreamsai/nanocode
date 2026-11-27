@@ -124,15 +124,15 @@ fn truncate_middle_tokens(text: &str, max_tokens: usize) -> String {
     if max_tokens > 0 && text.len() <= byte_budget {
         return text.to_owned();
     }
-    truncate_middle(text, byte_budget, true)
+    truncate_middle(text, byte_budget)
 }
 
-fn truncate_middle(text: &str, byte_budget: usize, use_tokens: bool) -> String {
+fn truncate_middle(text: &str, byte_budget: usize) -> String {
     if text.is_empty() {
         return String::new();
     }
     if byte_budget == 0 {
-        return truncation_marker(use_tokens, text.len(), text.chars().count());
+        return truncation_marker(text.len());
     }
     if text.len() <= byte_budget {
         return text.to_owned();
@@ -143,21 +143,12 @@ fn truncate_middle(text: &str, byte_budget: usize, use_tokens: bool) -> String {
     let suffix_start = text
         .ceil_char_boundary(text.len().saturating_sub(right_budget))
         .max(prefix_end);
-    let removed = &text[prefix_end..suffix_start];
-    let marker = truncation_marker(
-        use_tokens,
-        text.len().saturating_sub(byte_budget),
-        removed.chars().count(),
-    );
+    let marker = truncation_marker(text.len().saturating_sub(byte_budget));
     format!("{}{marker}{}", &text[..prefix_end], &text[suffix_start..])
 }
 
-fn truncation_marker(use_tokens: bool, removed_bytes: usize, removed_chars: usize) -> String {
-    if use_tokens {
-        format!("…{} tokens truncated…", approx_tokens(removed_bytes))
-    } else {
-        format!("…{removed_chars} chars truncated…")
-    }
+fn truncation_marker(removed_bytes: usize) -> String {
+    format!("…{} tokens truncated…", approx_tokens(removed_bytes))
 }
 
 const fn approx_tokens(bytes: usize) -> usize {
