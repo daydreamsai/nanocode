@@ -779,7 +779,10 @@ impl Resident for ThreadFold {
         log: &'a Arc<dyn LogHost>,
         scope: &'a str,
     ) -> StoreFuture<'a, Result<bool, StoreError>> {
-        Box::pin(adopt::due(log, scope))
+        Box::pin(async move {
+            let first = log.scan(scope, 0, nanocode_turnlog::FIRST_ROW + 1).await?;
+            Ok(first.iter().any(|(_, row)| self.foreign(row)))
+        })
     }
 
     fn adopt<'a>(

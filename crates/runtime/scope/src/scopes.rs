@@ -756,21 +756,19 @@ impl<F: Resident> Inner<F> {
             if let Some(loaded) = self.adoption(scope, now, foreign).await? {
                 return Ok(loaded);
             }
-            return self.fresh(scope, now).await;
+            return self.fresh(scope, due, now).await;
         }
         if foreign.is_some() || self.fold.adoption(&self.logs.load, scope).await? {
             return Err(self.queue(scope, due));
         }
-        self.fresh(scope, now).await
+        self.fresh(scope, due, now).await
     }
 
-    async fn fresh(&self, scope: &str, now: u64) -> Result<Loaded<F::State>, ScopeError> {
+    async fn fresh(&self, scope: &str, due: Due, now: u64) -> Result<Loaded<F::State>, ScopeError> {
         let next = self.fold.first_row();
         let tail = self.logs.load.scan(scope, next, SCAN_END).await?;
-        if let Some((seq, _)) = tail.iter().find(|(_, row)| self.fold.foreign(row)) {
-            return Err(ScopeError::Store(StoreError::Backend(format!(
-                "row {seq} of {scope} was written outside the scope, and its fold found nothing to adopt"
-            ))));
+        if tail.iter().any(|(_, row)| self.fold.foreign(row)) {
+            return Err(self.queue(scope, due));
         }
         Ok(Loaded {
             state: self.fold.empty(),
@@ -947,7 +945,7 @@ impl<F: Resident> Inner<F> {
             rows,
             bytes,
         } = match (self.fold.adopt(&self.logs.adopt, scope).await?, foreign) {
-            (None, None) => return Ok(None),
+            (None, None) => return self.plain(scope, now).await.map(Some),
             (None, Some(seq)) => {
                 return Err(ScopeError::Store(StoreError::Backend(format!(
                     "row {seq} of {scope} past its checkpoint was written outside the scope, and its log adopts nothing"
@@ -968,6 +966,20 @@ impl<F: Resident> Inner<F> {
             tail,
             adopted: Some((rows, bytes)),
         }))
+    }
+
+    async fn plain(&self, scope: &str, now: u64) -> Result<Loaded<F::State>, ScopeError> {
+        let next = self.fold.first_row();
+        let tail = self.logs.adopt.scan(scope, next, SCAN_END).await?;
+        let bytes: usize = tail.iter().map(|(_, row)| row.len()).sum();
+        Ok(Loaded {
+            state: self.fold.empty(),
+            next,
+            checkpointed: Checkpointed::empty(now),
+            parts: 0,
+            adopted: Some((tail.len() as u64, bytes as u64)),
+            tail,
+        })
     }
 
     async fn restore(
