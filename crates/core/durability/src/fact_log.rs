@@ -46,6 +46,10 @@ impl FactSink for Forward<'_> {
         self.0.put_blob(digest, json)
     }
 
+    fn put_interned(&mut self, digest: &Digest, json: &RawValue) -> Result<(), FoldError> {
+        self.0.put_interned(digest, json)
+    }
+
     fn append(&mut self, fact: StoredFact) -> Result<u64, FoldError> {
         self.0.append(fact)
     }

@@ -310,6 +310,10 @@ impl FactSink for Sink<'_> {
         })
     }
 
+    fn put_interned(&mut self, digest: &Digest, json: &RawValue) -> Result<(), FoldError> {
+        self.put_blob(digest, json)
+    }
+
     fn append(&mut self, fact: StoredFact) -> Result<u64, FoldError> {
         let state = match fact {
             Fact::Marker(Marker::Blob { .. }) => None,

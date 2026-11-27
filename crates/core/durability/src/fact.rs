@@ -373,6 +373,10 @@ pub trait FactSink {
 
     fn put_blob(&mut self, digest: &Digest, json: &RawValue) -> Result<(), FoldError>;
 
+    fn put_interned(&mut self, _digest: &Digest, _json: &RawValue) -> Result<(), FoldError> {
+        Ok(())
+    }
+
     fn append(&mut self, fact: StoredFact) -> Result<u64, FoldError>;
 
     fn cache_due(&self) -> bool {
@@ -656,6 +660,7 @@ impl<F: DurableFold> Folded<F> {
             "a sink hands out sequence numbers past the fold"
         );
         let mut fresh: Vec<(Digest, &RawValue)> = Vec::new();
+        let mut interned: Vec<(Digest, &RawValue)> = Vec::new();
         let values = &mut self.values;
         let stored: StoredFact = fact.try_map(
             |json| {
@@ -666,6 +671,8 @@ impl<F: DurableFold> Folded<F> {
                 let (blob, new) = values.intern(digest);
                 if new {
                     fresh.push((digest, &**json));
+                } else {
+                    interned.push((digest, &**json));
                 }
                 Ok(Value::Blob(blob))
             },
@@ -687,6 +694,9 @@ impl<F: DurableFold> Folded<F> {
                 bytes: json.get().len() as u64,
             });
             sink.append(marker)?;
+        }
+        for (digest, json) in &interned {
+            sink.put_interned(digest, json)?;
         }
         let written = sink.append(stored)?;
         assert_eq!(
