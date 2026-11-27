@@ -9,7 +9,6 @@ impl ImageWindow {
     pub const CLAUDE_LONG_CONTEXT: Self = Self::images(600);
     pub const CODEX: Self = Self::images(500);
     pub const WORKERS_AI: Self = Self::images(8);
-    pub const NONE: Self = Self::images(0);
     pub const GATEWAY: Self = Self {
         images: None,
         bytes: Some(2_641_785),
@@ -67,9 +66,6 @@ impl ImageWindow {
             .and_then(|data| data.split([';', ',']).next())
             .map_or_else(|| reference.to_owned(), |media| format!("inline {media}"));
         match self.images {
-            Some(0) => {
-                format!("[image omitted from this request, which accepts no images: {reference}]")
-            }
             Some(images) => format!(
                 "[image omitted from this request, which keeps only the newest {images} images: {reference}]"
             ),

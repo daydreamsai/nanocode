@@ -112,11 +112,7 @@ pub(super) fn request_response<'a>(
             .wire_cleared(messages, &suffix, request.effort_updates)
             .await?;
         let (mut sent, kept) = images::evict_images(
-            request_images(
-                &state.model,
-                state.context_window_tokens,
-                client.sends_plain_messages(),
-            ),
+            request_images(&state.model, state.context_window_tokens),
             cleared,
         );
         let kept = if kept.iter().any(Option::is_some) {
@@ -242,11 +238,7 @@ pub(super) fn request_response<'a>(
                 .await?;
             let kept;
             (sent, kept) = images::evict_images(
-                request_images(
-                    &state.model,
-                    state.context_window_tokens,
-                    client.sends_plain_messages(),
-                ),
+                request_images(&state.model, state.context_window_tokens),
                 cleared,
             );
             let kept = if kept.iter().any(Option::is_some) {

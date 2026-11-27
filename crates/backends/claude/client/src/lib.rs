@@ -2109,7 +2109,6 @@ pub struct ClaudeClient {
     subscription_session: String,
 
     subscription_cache_tail: bool,
-    plain_messages: bool,
     gzip_rejected: Arc<std::sync::atomic::AtomicBool>,
     http_layer: Option<Arc<dyn transport::Layer>>,
     root: Option<Arc<Root>>,
@@ -2166,7 +2165,6 @@ impl ClaudeClient {
             subscription_identity: SubscriptionIdentity::default(),
             subscription_session: nanocode_platform::uuid_v4().to_string(),
             subscription_cache_tail: true,
-            plain_messages: false,
             gzip_rejected: Arc::default(),
             http_layer: None,
             root: None,
@@ -2221,7 +2219,6 @@ impl ClaudeClient {
             subscription_identity: SubscriptionIdentity::default(),
             subscription_session: nanocode_platform::uuid_v4().to_string(),
             subscription_cache_tail: true,
-            plain_messages: false,
             gzip_rejected: Arc::default(),
             http_layer: None,
             root: None,
@@ -2242,7 +2239,6 @@ impl ClaudeClient {
             subscription_identity: SubscriptionIdentity::default(),
             subscription_session: nanocode_platform::uuid_v4().to_string(),
             subscription_cache_tail: true,
-            plain_messages: false,
             gzip_rejected: Arc::default(),
             http_layer: None,
             root: None,
@@ -2259,17 +2255,6 @@ impl ClaudeClient {
     pub fn with_http_layer(mut self, layer: impl transport::Layer) -> Self {
         self.http_layer = Some(Arc::new(layer));
         self
-    }
-
-    #[must_use]
-    pub const fn plain_messages(mut self) -> Self {
-        self.plain_messages = true;
-        self
-    }
-
-    #[must_use]
-    pub const fn sends_plain_messages(&self) -> bool {
-        self.plain_messages
     }
 
     #[must_use]
@@ -2514,14 +2499,11 @@ impl ClaudeClient {
                 tools: None,
                 digests: None,
             })
-        } else if self.plain_messages {
-            plain_request(head)?;
-            api_body(head, messages, streaming, None, cache, None)
         } else {
             let metadata = self
                 .subscription_identity
                 .api_metadata(&self.subscription_session)?;
-            api_body(head, messages, streaming, None, cache, Some(&metadata))
+            api_body(head, messages, streaming, None, cache, &metadata)
         }
     }
 
@@ -2649,11 +2631,6 @@ impl ClaudeClient {
                 "message threads need the Messages API wire, not the subscription wire".into(),
             ));
         }
-        if self.plain_messages {
-            return Err(ClaudeError::Protocol(
-                "message threads need the Messages API wire, not the plain Messages wire".into(),
-            ));
-        }
         let metadata = self
             .subscription_identity
             .api_metadata(&self.subscription_session)?;
@@ -2664,7 +2641,7 @@ impl ClaudeClient {
                 wire.streaming,
                 Some(param),
                 None,
-                Some(&metadata),
+                &metadata,
             )?
             .body,
         );
@@ -2843,12 +2820,6 @@ impl ClaudeClient {
             if wire.thread.is_some() && !betas.contains(&MESSAGE_THREADS_BETA) {
                 betas.push(MESSAGE_THREADS_BETA);
             }
-            if self.plain_messages && !betas.is_empty() {
-                return Err(ClaudeError::Protocol(format!(
-                    "the plain Messages wire carries no anthropic-beta header, but this request needs {}",
-                    betas.join(",")
-                )));
-            }
             if !betas.is_empty() {
                 let value = nanocode_http::types::header::HeaderValue::from_str(&betas.join(","))
                     .map_err(|_| {
@@ -2895,7 +2866,7 @@ impl ClaudeClient {
                     );
                 }
                 headers.remove("x-claude-code-request-class");
-            } else if !self.plain_messages {
+            } else {
                 headers.insert(
                     "x-claude-code-session-id",
                     nanocode_http::types::header::HeaderValue::from_str(&self.subscription_session)
@@ -3526,42 +3497,13 @@ impl Encoding {
     }
 }
 
-fn plain_request(head: &MessagesRequest) -> Result<(), ClaudeError> {
-    let carried = [
-        ("speed", head.speed.is_some()),
-        ("context_management", head.context_management.is_some()),
-        ("compaction", head.compaction.is_some()),
-        ("diagnostics", head.diagnostics.is_some()),
-        ("container", head.container.is_some()),
-        ("effort updates", head.effort_updates),
-        (
-            "server tools",
-            head.tools
-                .iter()
-                .any(|tool| matches!(tool, ClaudeToolSpec::Server(_))),
-        ),
-        (
-            "deferred tools",
-            head.tools
-                .iter()
-                .any(|tool| matches!(tool, ClaudeToolSpec::Client(tool) if tool.defer_loading)),
-        ),
-    ];
-    match carried.iter().find(|(_, carried)| *carried) {
-        Some((field, _)) => Err(ClaudeError::Protocol(format!(
-            "the plain Messages wire carries no {field}"
-        ))),
-        None => Ok(()),
-    }
-}
-
 fn api_body<M: WireMessage>(
     head: &MessagesRequest,
     messages: &[M],
     streaming: bool,
     thread: Option<&ThreadParam>,
     cache: Option<&WireCache>,
-    metadata: Option<&Value>,
+    metadata: &Value,
 ) -> Result<WireBody, ClaudeError> {
     let continuing = matches!(thread, Some(ThreadParam::Continue { .. }));
     let MessagesRequest {
@@ -3604,8 +3546,7 @@ fn api_body<M: WireMessage>(
     }
     #[derive(Serialize)]
     struct Tail<'a> {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        metadata: Option<&'a Value>,
+        metadata: &'a Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread: Option<&'a ThreadParam>,
         stream: bool,

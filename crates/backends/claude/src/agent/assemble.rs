@@ -422,8 +422,7 @@ pub(super) fn build(mut builder: ClaudeBuilder) -> Result<(Agent, AgentEvents)> 
                 .clone()
                 .or_else(|| kept.template.as_deref().and_then(crate::durability::prefix))
         })
-        .filter(|kept| durable::is_code_only_catalog(&kept.tools) == builder.code_only)
-        .filter(|_| !builder.claude.client.sends_plain_messages());
+        .filter(|kept| durable::is_code_only_catalog(&kept.tools) == builder.code_only);
     match &mut restored.context {
         Some(kept) if kept_prefix.is_some() => kept.prefix.clone_from(&kept_prefix),
         _ => nanocode_trace::info_span!(target: "nanocode", "claude.build.strip")
@@ -533,7 +532,6 @@ pub(super) fn build(mut builder: ClaudeBuilder) -> Result<(Agent, AgentEvents)> 
         wire_cache: crate::WireCache::default(),
         context_window_tokens: builder.context_window_tokens,
         auto_compact_window_tokens: builder.auto_compact_window_tokens,
-        max_messages: builder.max_messages,
         auto_compact_token_limit: Atom::default(),
         images: builder.images,
         session_id,

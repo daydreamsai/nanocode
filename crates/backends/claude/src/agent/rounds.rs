@@ -177,11 +177,10 @@ pub(super) fn run_rounds<'a>(
                 .fold(0u64, u64::saturating_add);
             if conversation.allows_auto_compaction()
                 && (!conversation.messages.is_empty() || !conversation.summary.is_empty())
-                && (conversation
+                && conversation
                     .active_context_tokens
                     .saturating_add(incoming_tokens)
                     >= cursor.threshold
-                    || state.crowded(conversation.messages.len()))
             {
                 state
                     .stage_cursor(&mut cursor, conversation, journal)
@@ -344,8 +343,7 @@ pub(super) fn run_rounds<'a>(
                 && index > 0
                 && conversation.allows_auto_compaction()
                 && !conversation.messages.is_empty()
-                && (conversation.active_context_tokens >= cursor.threshold
-                    || state.crowded(conversation.messages.len()))
+                && conversation.active_context_tokens >= cursor.threshold
             {
                 state.flush_journal(journal).await?;
                 add_usage(

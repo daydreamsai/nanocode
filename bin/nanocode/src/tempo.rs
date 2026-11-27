@@ -52,7 +52,6 @@ const TEMPO_GATEWAY: &str = "https://gateway.tempo-dev.workers.dev";
 const BOUNDLESS: &str = "https://api.inference.boundless.network/mpp/v1";
 const XGATE: &str = "https://api.xgate.run";
 const XGATE_OPERATION: &str = "messages";
-const XGATE_MESSAGES: usize = 256;
 const TEMPO_SERVICES: &str = "*.mpp.tempo.xyz";
 const OWN_PROXY_SETTINGS: [&str; 10] = [
     "HTTP_PROXY",
@@ -1522,7 +1521,6 @@ impl Tempo {
                     Default::default(),
                 )
                 .with_http_layer(xgate.clone())
-                .plain_messages()
             }),
             payments: payments.clone(),
             listing: Listing::remote(
@@ -1572,8 +1570,7 @@ impl Tempo {
                 })?;
             Ok(builder
                 .max_tokens(limits.output_tokens)
-                .context_window_tokens(limits.context_tokens)
-                .max_messages(XGATE_MESSAGES))
+                .context_window_tokens(limits.context_tokens))
         })
     }
 

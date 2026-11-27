@@ -174,7 +174,6 @@ impl RuntimeBackend for ClaudeHarness {
             .as_ref()
             .and_then(|client_for| client_for(&spec))
             .unwrap_or_else(|| self.client.clone());
-        let plain = client.sends_plain_messages();
         let settings = settings.or(&self.settings.clone().or(&defaults));
         let configure = self.configure.clone();
         let routed = self
@@ -202,10 +201,7 @@ impl RuntimeBackend for ClaudeHarness {
                 && spec.checkpoint.is_none()
                 && !matches!(settings.tools, Some(AgentTools::PerAgent(_)));
             let host = services.clone();
-            let shared = match plain {
-                true => Vec::new(),
-                false => services.shared_tools(remote).await?,
-            };
+            let shared = services.shared_tools(remote).await?;
             if spec.model.family() != HarnessFamily::Claude {
                 return Err(NanocodeError::InvalidRequest(
                     "the Claude harness requires a Claude model".into(),

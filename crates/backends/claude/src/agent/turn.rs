@@ -317,21 +317,12 @@ pub(super) fn summarize_locked<'a>(
         let mut template = cursor.template.clone();
         if matches!(mode, CompactionMode::ContextRecovery) {
             template.effort_updates = false;
-            match (
-                recovery_thinking(&template.model),
-                state.client.sends_plain_messages(),
-            ) {
-                (RecoveryThinking::Disabled, _) => {
+            match recovery_thinking(&template.model) {
+                RecoveryThinking::Disabled => {
                     template.thinking = Some(json!({"type":"disabled"}));
                     template.output_config = None;
                 }
-                (RecoveryThinking::AdaptiveLow | RecoveryThinking::BetweenTools, true) => {
-                    template.thinking = Some(json!({"type":"adaptive"}));
-                    template.output_config = Some(crate::OutputConfig {
-                        effort: crate::Effort::Low,
-                    });
-                }
-                (RecoveryThinking::AdaptiveLow, false) => {
+                RecoveryThinking::AdaptiveLow => {
                     template.thinking = Some(json!({
                         "type":"adaptive",
                         "block_binding":{"prefix_mismatch_behavior":"drop_block"},
@@ -340,7 +331,7 @@ pub(super) fn summarize_locked<'a>(
                         effort: crate::Effort::Low,
                     });
                 }
-                (RecoveryThinking::BetweenTools, false) => {
+                RecoveryThinking::BetweenTools => {
                     template.thinking = Some(json!({"type":"between_tools"}));
                     template.output_config = Some(crate::OutputConfig {
                         effort: crate::Effort::Low,
@@ -349,7 +340,6 @@ pub(super) fn summarize_locked<'a>(
             }
         }
         let served = if matches!(mode, CompactionMode::ContextRecovery)
-            || state.client.sends_plain_messages()
             || state.summary_refused.load(Ordering::SeqCst)
             || state.holds_back_formats()
             || template
