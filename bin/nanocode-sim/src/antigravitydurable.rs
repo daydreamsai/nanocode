@@ -64,10 +64,11 @@ pub enum AntigravityMutation {
     HarnessDefaultsHigh,
     Gemini4OffersNone,
     Gemini4DefaultsHigh,
+    SteerJoinsResponses,
 }
 
 impl AntigravityMutation {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::None,
         Self::MovedForgetsResults,
         Self::ReplayReruns,
@@ -82,6 +83,7 @@ impl AntigravityMutation {
         Self::HarnessDefaultsHigh,
         Self::Gemini4OffersNone,
         Self::Gemini4DefaultsHigh,
+        Self::SteerJoinsResponses,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -106,6 +108,7 @@ impl AntigravityMutation {
             Self::HarnessDefaultsHigh => "antigravity_harness_defaults_high",
             Self::Gemini4OffersNone => "antigravity_gemini4_offers_none",
             Self::Gemini4DefaultsHigh => "antigravity_gemini4_defaults_high",
+            Self::SteerJoinsResponses => "antigravity_steer_joins_responses",
         }
     }
 
@@ -123,6 +126,7 @@ impl AntigravityMutation {
             Self::CompactionOriginMissing => Production::CompactionOriginMissing,
             Self::XhighAsHigh => Production::XhighAsHigh,
             Self::HarnessDefaultsHigh => Production::HarnessDefaultsHigh,
+            Self::SteerJoinsResponses => Production::SteerJoinsResponses,
             Self::Gemini4OffersNone | Self::Gemini4DefaultsHigh => Production::None,
         }
     }
@@ -142,7 +146,8 @@ impl AntigravityMutation {
             | Self::OriginMissing
             | Self::CompactionOriginMissing
             | Self::XhighAsHigh
-            | Self::HarnessDefaultsHigh => Types::None,
+            | Self::HarnessDefaultsHigh
+            | Self::SteerJoinsResponses => Types::None,
         }
     }
 
@@ -245,6 +250,28 @@ impl Wire {
 
 struct Sender(Arc<Wire>);
 
+fn text_after_response(body: &str) -> Option<String> {
+    let body: Value = serde_json::from_str(body).ok()?;
+    body["contents"]
+        .as_array()?
+        .iter()
+        .enumerate()
+        .find_map(|(index, content)| {
+            let parts = content["parts"].as_array()?;
+            let response = parts
+                .iter()
+                .position(|part| part.get("functionResponse").is_some())?;
+            parts[response..]
+                .iter()
+                .any(|part| part.get("text").is_some())
+                .then(|| {
+                    format!(
+                        "antigravity_text_after_response: content {index} puts text after a function response, which Vertex rejects"
+                    )
+                })
+        })
+}
+
 impl nanocode_http::layer::Sender for Sender {
     fn send(
         &self,
@@ -259,8 +286,11 @@ impl nanocode_http::layer::Sender for Sender {
             if let Err(error) = check_origin(SESSION, Some(TURN)) {
                 wire.wrong.update(|wrong| wrong.push(error.clone()));
             }
-            wire.bodies
-                .update(|bodies| bodies.push(String::from_utf8_lossy(&request.body).into_owned()));
+            let body = String::from_utf8_lossy(&request.body).into_owned();
+            if let Some(error) = text_after_response(&body) {
+                wire.wrong.update(|wrong| wrong.push(error.clone()));
+            }
+            wire.bodies.update(|bodies| bodies.push(body.clone()));
             if call == 0 {
                 return Ok(model_response(
                     vec![
@@ -273,7 +303,9 @@ impl nanocode_http::layer::Sender for Sender {
                 wire.waiting_for_steer.fire();
                 wire.steered.wait().await;
                 return Ok(model_response(
-                    vec![json!({"text": "Awaiting instructions"})],
+                    vec![
+                        json!({"functionCall": {"name": "manage_task", "args": {"Action": "list"}}}),
+                    ],
                     true,
                 ));
             }

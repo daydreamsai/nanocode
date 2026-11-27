@@ -813,7 +813,11 @@ impl Inner {
         }
         state.step += 1;
         match state.contents.last_mut() {
-            Some(last) if last.role == "user" => {
+            Some(last)
+                if last.role == "user"
+                    && (last.parts.iter().all(|part| part.function_response.is_none())
+                        || crate::sim::mutated(crate::sim::Mutation::SteerJoinsResponses)) =>
+            {
                 state.transcript.push(Content::user(parts.clone()));
                 last.parts.extend(parts);
             }
