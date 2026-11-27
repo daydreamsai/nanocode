@@ -36,10 +36,9 @@ pub enum Mutation {
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);
-static FORCED: AtomicU8 = AtomicU8::new(UNFORCED);
-const UNFORCED: u8 = 0;
-const FORCED_TAGGED: u8 = 1;
-const FORCED_STAMPED: u8 = 2;
+thread_local! {
+    static FORCED: std::cell::Cell<Option<crate::Format>> = const { std::cell::Cell::new(None) };
+}
 
 pub fn mutate(mutation: Mutation) {
     MUTATION.store(mutation as u8, Ordering::SeqCst);
@@ -50,23 +49,12 @@ pub fn mutated(mutation: Mutation) -> bool {
 }
 
 pub fn force(format: Option<crate::Format>) {
-    let code = match format {
-        None => UNFORCED,
-        Some(crate::Format::Tagged) => FORCED_TAGGED,
-        Some(crate::Format::Stamped) => FORCED_STAMPED,
-    };
-    FORCED.store(code, Ordering::SeqCst);
+    FORCED.set(format);
+    assert_eq!(FORCED.get(), format, "a seed's thread holds the format it forced");
 }
 
 pub(crate) fn forced() -> Option<crate::Format> {
-    match FORCED.load(Ordering::Relaxed) {
-        FORCED_TAGGED => Some(crate::Format::Tagged),
-        FORCED_STAMPED => Some(crate::Format::Stamped),
-        code => {
-            assert_eq!(code, UNFORCED, "a forced row format code names a format");
-            None
-        }
-    }
+    FORCED.get()
 }
 
 pub async fn open(
