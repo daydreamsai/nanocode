@@ -56,6 +56,7 @@ pub enum Route {
     Native,
     Tempo,
     Boundless,
+    Xgate,
 }
 
 impl Route {
@@ -64,6 +65,7 @@ impl Route {
             Self::Native => None,
             Self::Tempo => Some(Tempo::NAME),
             Self::Boundless => Some(Tempo::BOUNDLESS),
+            Self::Xgate => Some(Tempo::XGATE),
         }
     }
 
@@ -72,6 +74,7 @@ impl Route {
             None => Ok(Self::Native),
             Some(Tempo::NAME) => Ok(Self::Tempo),
             Some(Tempo::BOUNDLESS) => Ok(Self::Boundless),
+            Some(Tempo::XGATE) => Ok(Self::Xgate),
             Some(other) => Err(format!("this build does not route models through {other}").into()),
         }
     }
@@ -81,12 +84,13 @@ impl Route {
             Self::Native => model.to_string(),
             Self::Tempo => format!("{}{model}", Tempo::PREFIX),
             Self::Boundless => format!("{}{}/{model}", Tempo::PREFIX, Tempo::BOUNDLESS),
+            Self::Xgate => format!("{}{}/{model}", Tempo::PREFIX, Tempo::XGATE),
         }
     }
 }
 
 pub fn follows_harness(route: Route, model: &ModelSelection) -> bool {
-    route != Route::Boundless
+    !matches!(route, Route::Boundless | Route::Xgate)
         && model.as_claude().is_none()
         && model
             .as_codex()
@@ -396,6 +400,22 @@ impl ModelClients {
                 .into());
             }
             return Ok((Route::Boundless, Tempo::boundless_model(id.trim())));
+        }
+        if let Some(id) = id
+            .strip_prefix(Tempo::XGATE)
+            .and_then(|id| id.strip_prefix('/'))
+        {
+            if id.trim().is_empty() {
+                return Err(format!(
+                    "name a model after {}{}/, such as {}{}/claude-opus-5-5",
+                    Tempo::PREFIX,
+                    Tempo::XGATE,
+                    Tempo::PREFIX,
+                    Tempo::XGATE
+                )
+                .into());
+            }
+            return Ok((Route::Xgate, Tempo::xgate_model(id.trim())));
         }
         Ok((Route::Tempo, Tempo::model(id)))
     }
@@ -740,6 +760,10 @@ impl Host {
                 client.with_install_id(install.clone())
             }
         };
+        let (xgate, xgate_limits) = match &config.clients.tempo {
+            Some(tempo) => (Some(tempo.xgate()), Some(tempo.xgate_limits())),
+            None => (None, None),
+        };
         let (tempo_openai, tempo_claude, boundless) = match &config.clients.tempo {
             Some(tempo) => (
                 Some(
@@ -841,10 +865,15 @@ impl Host {
                 .as_ref()
                 .map_or_else(ClaudeClient::default, |claude| claude()),
         ))
-        .client_for(move |request| {
-            tempo_claude
+        .client_for(move |request| match route(request) {
+            Some(Route::Tempo) => tempo_claude.clone(),
+            Some(Route::Xgate) => xgate.clone(),
+            _ => None,
+        })
+        .configure_for(move |request| {
+            xgate_limits
                 .clone()
-                .filter(|_| route(request) == Some(Route::Tempo))
+                .filter(|_| route(request) == Some(Route::Xgate))
         })
         .direct_subagents(config.subagents == Subagents::AllModels)
         .headless(config.headless)
@@ -929,6 +958,7 @@ impl Host {
         route: Route,
     ) -> Result<(Agent, AgentEvents)> {
         self.window_listed(model).await?;
+        self.route_listed(route).await;
         self.replacement_hand().await;
         let spawn = match route.provider() {
             Some(provider) => self.runtime.spawn().provider(provider),
@@ -947,8 +977,16 @@ impl Host {
         stored: &nanocode::durability::StoredSession,
     ) -> Result<(Agent, AgentEvents)> {
         self.window_listed(&stored.summary.record.model).await?;
+        self.route_listed(Route::of(stored.summary.record.provider.as_deref())?)
+            .await;
         self.replacement_hand().await;
         Ok(self.runtime.open_loaded(store, stored).await?)
+    }
+
+    async fn route_listed(&self, route: Route) {
+        if let (Route::Xgate, Some(tempo)) = (route, self.config.clients.tempo_models()) {
+            tempo.load().await;
+        }
     }
 
     async fn window_listed(&self, model: &ModelSelection) -> Result<()> {

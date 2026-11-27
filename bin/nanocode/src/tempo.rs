@@ -50,6 +50,9 @@ const MERCATOR: &str = "https://mercator.sh/mcp";
 const GATEWAY: &str = "https://gateway.tempo-dev.workers.dev/mcp";
 const TEMPO_GATEWAY: &str = "https://gateway.tempo-dev.workers.dev";
 const BOUNDLESS: &str = "https://api.inference.boundless.network/mpp/v1";
+const XGATE: &str = "https://api.xgate.run";
+const XGATE_OPERATION: &str = "messages";
+const XGATE_MESSAGES: usize = 256;
 const TEMPO_SERVICES: &str = "*.mpp.tempo.xyz";
 const OWN_PROXY_SETTINGS: [&str; 10] = [
     "HTTP_PROXY",
@@ -1234,6 +1237,13 @@ struct Offer {
     provider: String,
     upstream: String,
     price: Option<String>,
+    limits: Option<Limits>,
+}
+
+#[derive(Clone, Copy)]
+struct Limits {
+    output_tokens: u32,
+    context_tokens: u64,
 }
 
 impl Offer {
@@ -1330,6 +1340,51 @@ fn boundless_offers(url: &str, listing: &Value) -> std::result::Result<Vec<Offer
             provider: Tempo::BOUNDLESS.to_owned(),
             upstream: id.to_owned(),
             price: price(&entry["pricing"]),
+            limits: None,
+        });
+    }
+    Ok(offers)
+}
+
+fn xgate_offers(url: &str, listing: &Value) -> std::result::Result<Vec<Offer>, String> {
+    let mut offers = Vec::new();
+    for entry in listing["data"]
+        .as_array()
+        .ok_or_else(|| format!("{url} returned no model list"))?
+    {
+        let id = entry["id"]
+            .as_str()
+            .ok_or_else(|| format!("{url} listed a model without an id"))?;
+        let operations = entry["qualified_operations"]
+            .as_array()
+            .ok_or_else(|| format!("{url} lists no qualified operations for {id}"))?;
+        if !operations
+            .iter()
+            .any(|operation| operation == XGATE_OPERATION)
+        {
+            continue;
+        }
+        let profile = &entry["execution_profile"];
+        let tokens = |value: &Value, limit: &str| {
+            value
+                .as_u64()
+                .ok_or_else(|| format!("{url} lists no {limit} for {id}"))
+        };
+        let output_tokens = tokens(&profile["max_output_tokens"], "max_output_tokens")?;
+        offers.push(Offer {
+            model: id.parse::<Model>()?,
+            provider: Tempo::XGATE.to_owned(),
+            upstream: id.to_owned(),
+            price: None,
+            limits: Some(Limits {
+                output_tokens: u32::try_from(output_tokens).map_err(|error| {
+                    format!("{url} lists max_output_tokens {output_tokens} for {id}: {error}")
+                })?,
+                context_tokens: tokens(
+                    &profile["capabilities"]["context_window"],
+                    "context_window",
+                )?,
+            }),
         });
     }
     Ok(offers)
@@ -1355,6 +1410,7 @@ fn gateway_offers(url: &str, listing: &Value) -> std::result::Result<Vec<Offer>,
                 .to_owned(),
             upstream: entry["upstream"].as_str().unwrap_or(id).to_owned(),
             price: price(&entry["house"]),
+            limits: None,
         };
         if offers.iter().all(|known| known.model != offer.model) {
             offers.push(offer);
@@ -1365,6 +1421,13 @@ fn gateway_offers(url: &str, listing: &Value) -> std::result::Result<Vec<Offer>,
 
 type OpenAiSource = Arc<dyn Fn() -> nanocode::codex::OpenAiBuilder + Send + Sync>;
 type ClaudeSource = Arc<dyn Fn() -> nanocode::claude::ClaudeClient + Send + Sync>;
+type ClaudeHook = Arc<
+    dyn Fn(
+            nanocode::claude::ClaudeBuilder,
+        ) -> std::result::Result<nanocode::claude::ClaudeBuilder, nanocode::NanocodeError>
+        + Send
+        + Sync,
+>;
 
 pub(crate) type Offered = Vec<(ModelSelection, Option<String>)>;
 
@@ -1373,9 +1436,11 @@ pub(crate) struct Tempo {
     openai: OpenAiSource,
     claude: ClaudeSource,
     boundless: OpenAiSource,
+    xgate: ClaudeSource,
     payments: Payments,
     listing: Arc<Listing>,
     catalog: Arc<Listing>,
+    xgate_catalog: Arc<Listing>,
 }
 
 impl Tempo {
@@ -1385,12 +1450,25 @@ impl Tempo {
     pub(crate) const ABOUT: &str = "models the Tempo gateway serves (OpenAI, Anthropic, Workers AI, Vercel, OpenRouter), paid from your Tempo ID account";
     pub(crate) const BOUNDLESS: &str = "boundless";
     pub(crate) const BOUNDLESS_ABOUT: &str = "models Boundless serves at api.inference.boundless.network, paid directly from your Tempo ID account";
+    pub(crate) const XGATE: &str = "xgate";
+    pub(crate) const XGATE_ABOUT: &str = "Claude models XGate serves at api.xgate.run on the Claude harness, paid directly from your Tempo ID account";
 
     fn new(payments: &Payments, args: &GatewayArgs, identity: Arc<Identity>) -> Result<Self> {
         let terms = Terms::tempo(args)?;
         let wallet = payments.wallet(
             &nanocode_http::Url::parse(&format!("{TEMPO_GATEWAY}/v1"))?,
             &terms,
+        );
+        let xgate_messages = format!("{XGATE}/providers/anthropic/v1/messages");
+        let xgate = Mpp::new(
+            payments.wallet(
+                &nanocode_http::Url::parse(XGATE)?,
+                &Terms {
+                    close: Close::Keep,
+                    ..terms.clone()
+                },
+            ),
+            (xgate_messages.clone(), None),
         );
         let unsponsored = Terms {
             gas: match terms.gas {
@@ -1405,6 +1483,7 @@ impl Tempo {
         )
         .identified(identity.clone());
         let client = payments.client()?;
+        let xgate_client = client.clone();
         let responses = Mpp::new(
             wallet.clone(),
             (format!("{TEMPO_GATEWAY}/v1/responses"), None),
@@ -1436,12 +1515,22 @@ impl Tempo {
                     .http_client(client.clone())
                     .http_layer(boundless.clone())
             }),
+            xgate: Arc::new(move || {
+                nanocode::claude::ClaudeClient::with_auth_headers(
+                    xgate_client.clone(),
+                    xgate_messages.clone(),
+                    Default::default(),
+                )
+                .with_http_layer(xgate.clone())
+                .plain_messages()
+            }),
             payments: payments.clone(),
             listing: Listing::remote(
                 format!("{TEMPO_GATEWAY}/api/auction/models"),
                 gateway_offers,
             ),
             catalog: Listing::remote(format!("{BOUNDLESS}/models"), boundless_offers),
+            xgate_catalog: Listing::remote(format!("{XGATE}/v1/models"), xgate_offers),
         })
     }
 
@@ -1457,10 +1546,44 @@ impl Tempo {
         (self.boundless)()
     }
 
+    pub(crate) fn xgate(&self) -> nanocode::claude::ClaudeClient {
+        (self.xgate)()
+    }
+
+    pub(crate) fn xgate_limits(&self) -> ClaudeHook {
+        let catalog = self.xgate_catalog.clone();
+        Arc::new(move |builder| {
+            let model = builder.selected_model().to_owned();
+            let limits = catalog
+                .read(|offers| {
+                    offers
+                        .iter()
+                        .find(|offer| offer.upstream == model)
+                        .and_then(|offer| offer.limits)
+                })
+                .map_err(|note| {
+                    nanocode::NanocodeError::InvalidRequest(format!("{}: {note}", Self::XGATE))
+                })?
+                .ok_or_else(|| {
+                    nanocode::NanocodeError::InvalidRequest(format!(
+                        "{} lists no {model} for the Messages API",
+                        Self::XGATE
+                    ))
+                })?;
+            Ok(builder
+                .max_tokens(limits.output_tokens)
+                .context_window_tokens(limits.context_tokens)
+                .max_messages(XGATE_MESSAGES))
+        })
+    }
+
     pub(crate) async fn load(&self) {
         nanocode_sync::future::join(
-            self.listing.load(&self.payments),
-            self.catalog.load(&self.payments),
+            nanocode_sync::future::join(
+                self.listing.load(&self.payments),
+                self.catalog.load(&self.payments),
+            ),
+            self.xgate_catalog.load(&self.payments),
         )
         .await;
     }
@@ -1471,6 +1594,7 @@ impl Tempo {
             [
                 (Route::Tempo, Self::NAME, Self::ABOUT),
                 (Route::Boundless, Self::BOUNDLESS, Self::BOUNDLESS_ABOUT),
+                (Route::Xgate, Self::XGATE, Self::XGATE_ABOUT),
             ]
             .map(|(route, name, about)| nanocode::subagents::SpawnProvider {
                 name: name.to_owned(),
@@ -1525,6 +1649,10 @@ impl Tempo {
         ModelSelection::Codex(Model::Custom(nanocode::CustomModel::new(id)))
     }
 
+    pub(crate) fn xgate_model(id: &str) -> ModelSelection {
+        ModelSelection::new(nanocode::HarnessFamily::Claude, id)
+    }
+
     pub(crate) fn groups(&self) -> (Vec<(String, Route, Offered)>, Option<String>) {
         let mut groups = Vec::new();
         let mut notes = Vec::new();
@@ -1541,6 +1669,15 @@ impl Tempo {
         }) {
             Ok(models) => groups.push((Self::BOUNDLESS.to_owned(), Route::Boundless, models)),
             Err(note) => notes.push(format!("{}: {note}", Self::BOUNDLESS)),
+        }
+        match self.xgate_catalog.read(|offers| {
+            offers
+                .iter()
+                .map(|offer| (Self::xgate_model(&offer.upstream), offer.price.clone()))
+                .collect::<Offered>()
+        }) {
+            Ok(models) => groups.push((Self::XGATE.to_owned(), Route::Xgate, models)),
+            Err(note) => notes.push(format!("{}: {note}", Self::XGATE)),
         }
         match self.listing.read(rows) {
             Ok(rows) => groups.extend(
@@ -1894,6 +2031,7 @@ pub(crate) fn apply(
             format!("{TEMPO_GATEWAY}/v1/responses"),
             format!("{TEMPO_GATEWAY}/v1/messages"),
             format!("{BOUNDLESS}/responses"),
+            format!("{XGATE}/providers/anthropic/v1/messages"),
         ],
         false => Vec::new(),
     };

@@ -797,6 +797,10 @@ fn model_max_tokens(model: &str) -> Option<u32> {
 
 pub const DEFAULT_COMPACTION_RESERVED_TOKENS: u64 = 20_000 + 13_000;
 
+const ROUND_MESSAGES: usize = 2;
+
+const TOOL_CALLER: &str = "caller";
+
 pub const DEFAULT_REFUSAL_CONTINUATIONS: u32 = 1;
 
 pub const DEFAULT_OUTPUT_CONTINUATIONS: u32 = 3;
@@ -840,8 +844,10 @@ pub enum RefusalFallbackScope {
 
 const STANDARD_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 
-fn request_images(model: &str, context_window_tokens: u64) -> ImageWindow {
-    if model.starts_with("@cf/") {
+fn request_images(model: &str, context_window_tokens: u64, plain: bool) -> ImageWindow {
+    if plain {
+        ImageWindow::NONE
+    } else if model.starts_with("@cf/") {
         ImageWindow::WORKERS_AI
     } else if context_window_tokens > STANDARD_CONTEXT_WINDOW_TOKENS {
         ImageWindow::CLAUDE_LONG_CONTEXT
@@ -890,6 +896,7 @@ pub struct ClaudeBuilder {
     steer_preempts_model: bool,
     context_window_tokens: u64,
     auto_compact_window_tokens: Option<u64>,
+    max_messages: Option<usize>,
     images: ImageHistory,
     system: String,
     system_blocks: Option<Vec<Value>>,
@@ -1000,6 +1007,7 @@ impl ClaudeBuilder {
             steer_preempts_model: false,
             context_window_tokens,
             auto_compact_window_tokens: None,
+            max_messages: None,
             images: ImageHistory::default(),
             system: String::new(),
             system_blocks: None,
@@ -1375,6 +1383,12 @@ impl ClaudeBuilder {
 
     pub const fn auto_compact_window_tokens(mut self, tokens: u64) -> Self {
         self.auto_compact_window_tokens = Some(tokens);
+        self
+    }
+
+    pub const fn max_messages(mut self, messages: usize) -> Self {
+        assert!(messages > ROUND_MESSAGES);
+        self.max_messages = Some(messages);
         self
     }
 
@@ -3234,6 +3248,68 @@ fn wire_messages(
     sent
 }
 
+fn plain_turns(
+    messages: Vec<HistoryMessage>,
+    floors: [Option<usize>; 2],
+) -> Result<(Vec<HistoryMessage>, [Option<usize>; 2])> {
+    let mut turns: Vec<HistoryMessage> = Vec::with_capacity(messages.len());
+    let mut moved = Vec::with_capacity(messages.len());
+    for mut message in messages {
+        if message.role() != Role::System {
+            let called = |block: &ContentBlock| match block {
+                ContentBlock::ToolUse { extra, .. } => extra.contains_key(TOOL_CALLER),
+                _ => false,
+            };
+            if message.role() == Role::Assistant
+                && message.mentions(TOOL_CALLER)
+                && message.any_block(called)
+            {
+                for block in &mut message.make_mut().content {
+                    if let ContentBlock::ToolUse { extra, .. } = block {
+                        extra.remove(TOOL_CALLER);
+                    }
+                }
+            }
+            moved.push(turns.len());
+            turns.push(message);
+            continue;
+        }
+        let blocks = message
+            .view()
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text, extra } if text.starts_with(DEVELOPER_NOTICE_OPEN) => {
+                    Ok(ContentBlock::Text {
+                        text: text.clone(),
+                        extra: extra.clone(),
+                    })
+                }
+                ContentBlock::Text { text, extra } => Ok(ContentBlock::Text {
+                    text: format!("{DEVELOPER_NOTICE_OPEN}{text}{DEVELOPER_NOTICE_CLOSE}"),
+                    extra: extra.clone(),
+                }),
+                _ => Err(NanocodeError::InvalidRequest(
+                    "the plain Messages wire carries only text in a system message".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        match turns.last_mut().filter(|turn| turn.role() == Role::User) {
+            Some(turn) => turn.make_mut().content.extend(blocks),
+            None => turns.push(HistoryMessage::from(Message {
+                role: Role::User,
+                content: blocks,
+                output_config: None,
+            })),
+        }
+        moved.push(turns.len() - 1);
+    }
+    Ok((
+        turns,
+        floors.map(|floor| floor.and_then(|at| moved.get(at).copied())),
+    ))
+}
+
 fn separated_result_companions(message: &HistoryMessage) -> HistoryMessage {
     let mut message = message.clone();
     if message.has_companions(|message| {
@@ -3688,6 +3764,7 @@ struct State {
     wire_cache: crate::WireCache,
     context_window_tokens: u64,
     auto_compact_window_tokens: Option<u64>,
+    max_messages: Option<usize>,
     auto_compact_token_limit: Atom<Option<u64>>,
     images: ImageHistory,
     workspace: String,
@@ -5534,16 +5611,18 @@ impl State {
                         | nanocode_agent_core::ClaudeModel::Mythos51
                 )
             ))
-        .then(|| {
-            json!({
+        .then(|| match self.client.sends_plain_messages() {
+            true => json!({"type":"adaptive","display":"summarized"}),
+            false => json!({
                 "type":"adaptive",
                 "display":"summarized",
                 "block_binding":{"prefix_mismatch_behavior":"drop_block"},
-            })
+            }),
         })
     }
     fn effort_updates_active(&self) -> bool {
         !self.client.uses_subscription()
+            && !self.client.sends_plain_messages()
             && !self.thinking_mode.get().disabled()
             && self
                 .model()
@@ -5578,7 +5657,10 @@ impl State {
         for message in &sent {
             message.mark_wire_cleared();
         }
-        Ok((sent, floors))
+        match self.client.sends_plain_messages() {
+            true => plain_turns(sent, floors),
+            false => Ok((sent, floors)),
+        }
     }
     fn cleared(
         &self,
@@ -5611,6 +5693,7 @@ impl State {
         let thinks = thinking
             .as_ref()
             .is_some_and(|thinking| thinking["type"] != "disabled");
+        let plain = self.client.sends_plain_messages();
         let mut request = MessagesRequest {
             model: self.model(),
             max_tokens: self.max_tokens.unwrap_or_else(|| {
@@ -5624,11 +5707,10 @@ impl State {
             speed,
             tool_choice: None,
             thinking,
-            context_management: (self.keep_thinking && thinks)
+            context_management: (self.keep_thinking && thinks && !plain)
                 .then(|| json!({"edits":[{"type":"clear_thinking_20251015","keep":"all"}]})),
             compaction: None,
-            diagnostics: self
-                .message_diagnostics
+            diagnostics: (self.message_diagnostics && !plain)
                 .then(|| json!({"previous_message_id":null})),
             system: self.current_system(),
             messages: Vec::new(),
@@ -6049,6 +6131,10 @@ impl State {
                 (definition, handler)
             })
             .collect()
+    }
+    fn crowded(&self, messages: usize) -> bool {
+        self.max_messages
+            .is_some_and(|max| messages.saturating_add(ROUND_MESSAGES) >= max)
     }
     fn compaction_threshold(&self) -> u64 {
         if let Some(limit) = *self.auto_compact_token_limit.get() {

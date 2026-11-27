@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 type Hook = Arc<dyn Fn(ClaudeBuilder) -> Result<ClaudeBuilder> + Send + Sync>;
 type Route = Arc<dyn Fn(&HarnessRequest) -> Option<ClaudeClient> + Send + Sync>;
+type Routed = Arc<dyn Fn(&HarnessRequest) -> Option<Hook> + Send + Sync>;
 type Direct = Arc<dyn Fn(&HarnessRequest) -> bool + Send + Sync>;
 #[derive(Clone)]
 pub struct ClaudeHarness {
@@ -19,6 +20,7 @@ pub struct ClaudeHarness {
     settings: Settings,
     configure: Option<Hook>,
     client_for: Option<Route>,
+    configure_for: Option<Routed>,
     direct_tools_for: Option<Direct>,
     direct_subagents: bool,
     headless: bool,
@@ -33,6 +35,7 @@ impl ClaudeHarness {
             settings: Settings::default(),
             configure: None,
             client_for: None,
+            configure_for: None,
             direct_tools_for: None,
             direct_subagents: false,
             headless: false,
@@ -95,6 +98,15 @@ impl ClaudeHarness {
         F: Fn(&HarnessRequest) -> Option<ClaudeClient> + Send + Sync + 'static,
     {
         self.client_for = Some(Arc::new(client_for));
+        self
+    }
+
+    #[must_use]
+    pub fn configure_for<F>(mut self, configure_for: F) -> Self
+    where
+        F: Fn(&HarnessRequest) -> Option<Hook> + Send + Sync + 'static,
+    {
+        self.configure_for = Some(Arc::new(configure_for));
         self
     }
 
@@ -162,8 +174,13 @@ impl RuntimeBackend for ClaudeHarness {
             .as_ref()
             .and_then(|client_for| client_for(&spec))
             .unwrap_or_else(|| self.client.clone());
+        let plain = client.sends_plain_messages();
         let settings = settings.or(&self.settings.clone().or(&defaults));
         let configure = self.configure.clone();
+        let routed = self
+            .configure_for
+            .as_ref()
+            .and_then(|configure_for| configure_for(&spec));
         let direct = self
             .direct_tools_for
             .as_ref()
@@ -185,7 +202,10 @@ impl RuntimeBackend for ClaudeHarness {
                 && spec.checkpoint.is_none()
                 && !matches!(settings.tools, Some(AgentTools::PerAgent(_)));
             let host = services.clone();
-            let shared = services.shared_tools(remote).await?;
+            let shared = match plain {
+                true => Vec::new(),
+                false => services.shared_tools(remote).await?,
+            };
             if spec.model.family() != HarnessFamily::Claude {
                 return Err(NanocodeError::InvalidRequest(
                     "the Claude harness requires a Claude model".into(),
@@ -212,6 +232,9 @@ impl RuntimeBackend for ClaudeHarness {
             }
             if let Some(configure) = configure {
                 builder = configure(builder)?.workspace(workspace.to_string_lossy().into_owned());
+            }
+            if let Some(routed) = routed {
+                builder = routed(builder)?;
             }
             if let Some(deadline) = deadline {
                 builder = builder.deadline(deadline);
