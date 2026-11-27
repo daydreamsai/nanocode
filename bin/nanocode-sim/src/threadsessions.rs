@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{collections::BTreeSet, convert::Infallible, ops::Range, sync::Arc};
 
 use nanocode::{
     backend::Prompt,
@@ -9,7 +9,7 @@ use nanocode_durability_core::{
     Decision, DurableFold, Fact, FactLog, FactLogs, FoldError, Folded, Input, InputKind, ModelOut,
     OwnedFact, Seen, StateStore, VALUE_INLINE_BYTES, Value, commit_fact, fold_facts,
 };
-use nanocode_turnlog::{CachedAt, Record, SNAPSHOT_RATIO, cache_key};
+use nanocode_turnlog::{CachedAt, FOLD_SNAPSHOT_KEY, Record, SNAPSHOT_RATIO, cache_key};
 use serde::{Deserialize, Serialize};
 use serde_json::{
     Map,
@@ -322,6 +322,75 @@ pub(crate) fn held(state: &ThreadState, thread: &str, sessions: &Sessions) -> Re
         checked += 1;
     }
     Ok(checked)
+}
+
+fn row_records(body: &str) -> Vec<Record> {
+    let inner = nanocode_turnlog::tagged_row(body).unwrap_or(body);
+    match nanocode_turnlog::standalone_plain(inner) {
+        Ok(Some(plain)) => nanocode_turnlog::decode(&plain).unwrap_or_default(),
+        _ => nanocode_turnlog::decode(inner).unwrap_or_default(),
+    }
+}
+
+fn named(state: &ThreadState, rows: &[(u64, String)]) -> BTreeSet<String> {
+    let mut named = BTreeSet::new();
+    for (key, value) in state.hosts() {
+        if key
+            .strip_prefix(FOLD_SNAPSHOT_KEY)
+            .is_some_and(|rest| rest.starts_with('\n'))
+            && let Ok(at) = serde_json::from_str::<CachedAt>(value.get())
+        {
+            named.insert(at.blob.key().as_str().to_owned());
+        }
+    }
+    for (_, body) in rows {
+        for record in row_records(body) {
+            let Record::Fact { fact, .. } = record else {
+                continue;
+            };
+            let seen: Result<_, Infallible> = fact.try_map(
+                |value| {
+                    if let Value::Blob(blob) = value
+                        && let Some(digest) = state.blob_digest(*blob)
+                    {
+                        named.insert(digest.key().as_str().to_owned());
+                    }
+                    Ok(())
+                },
+                |_| Ok(()),
+            );
+            let Ok(_) = seen;
+        }
+    }
+    named
+}
+
+pub(crate) struct Kept {
+    pub(crate) blobs: u64,
+    pub(crate) bytes: u64,
+}
+
+pub(crate) fn kept(
+    state: &ThreadState,
+    thread: &str,
+    rows: &[(u64, String)],
+) -> Result<Kept, String> {
+    let named = named(state, rows);
+    let mut kept = Kept { blobs: 0, bytes: 0 };
+    for (key, value) in state.stored_values() {
+        if nanocode_durability_core::BlobKey::parse(key).is_none() {
+            continue;
+        }
+        if !named.contains(key) {
+            return Err(format!(
+                "the resident state of {thread} holds the {} byte body of blob {key}, which no cached fold or fact names",
+                value.len()
+            ));
+        }
+        kept.blobs += 1;
+        kept.bytes += value.len() as u64;
+    }
+    Ok(kept)
 }
 
 pub(crate) fn cached(records: &[Record], thread: &str, sessions: &Sessions) -> Result<u64, String> {

@@ -39,10 +39,11 @@ pub enum Mutation {
     ClaimSkipsRow,
     AdoptionKeepsHistory,
     AdoptedServesLegacy,
+    ReplacedFoldKept,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::PartDropped,
         Self::AdoptionSkipsRetired,
         Self::AdoptionSkipsBlobs,
@@ -72,6 +73,7 @@ impl Mutation {
         Self::ResidentDropsBlob,
         Self::CacheDueIgnoresBlob,
         Self::AdoptionKeepsHistory,
+        Self::ReplacedFoldKept,
     ];
 
     #[must_use]
@@ -111,6 +113,7 @@ impl Mutation {
             Self::ClaimSkipsRow => "claim_skips_row",
             Self::AdoptionKeepsHistory => "adoption_keeps_history",
             Self::AdoptedServesLegacy => "adopted_serves_legacy",
+            Self::ReplacedFoldKept => "replaced_fold_kept",
         }
     }
 

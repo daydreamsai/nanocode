@@ -156,6 +156,7 @@ pub struct ThreadState {
     pub(crate) uncached: OrdMap<Arc<str>, u64>,
     pub(crate) logging: OrdMap<Arc<str>, u64>,
     pub(crate) blobs: Vector<Digest>,
+    pub(crate) cache_only: OrdSet<Digest>,
     pub(crate) generation: u64,
     pub(crate) row: u64,
 }
@@ -357,6 +358,81 @@ impl ThreadState {
     #[must_use]
     pub fn blob_body(&self, digest: &Digest) -> Option<&str> {
         self.stored(digest.key().as_str())
+    }
+
+    pub fn stored_values(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.stored.iter().map(|(key, value)| (key.as_ref(), value.as_ref()))
+    }
+
+    pub(crate) fn blob_known(&self, digest: &Digest) -> bool {
+        self.blobs.iter().any(|known| known == digest)
+    }
+
+    fn cached_blob(value: &RawValue) -> Option<Digest> {
+        serde_json::from_str::<CachedAt>(value.get())
+            .ok()
+            .map(|at| at.blob)
+    }
+
+    fn folds_name(&self, digest: &Digest) -> bool {
+        self.hosts
+            .iter()
+            .filter(|(key, _)| {
+                key.strip_prefix(FOLD_SNAPSHOT_KEY)
+                    .is_some_and(|rest| rest.starts_with('\n'))
+            })
+            .any(|(_, value)| Self::cached_blob(value).as_ref() == Some(digest))
+    }
+
+    fn named_by_values(&mut self, fact: &StoredFact) {
+        if self.cache_only.is_empty() {
+            return;
+        }
+        let blobs = &self.blobs;
+        let cache_only = &mut self.cache_only;
+        let named: Result<_, std::convert::Infallible> = fact.try_map(
+            |value| {
+                if let Value::Blob(blob) = value
+                    && let Some(digest) = blobs.get(blob.index() as usize)
+                {
+                    cache_only.remove(digest);
+                }
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        let Ok(_) = named;
+    }
+
+    fn recached(&mut self, state: &str, replaced: Option<Digest>, value: &RawValue) {
+        let Some(blob) = Self::cached_blob(value) else {
+            return;
+        };
+        let fresh = self.facts.back().is_some_and(|kept| {
+            matches!(&kept.fact, Fact::Marker(Marker::Blob { digest, .. }) if *digest == blob)
+        });
+        if fresh {
+            self.cache_only.insert(blob);
+        }
+        let Some(replaced) = replaced.filter(|replaced| *replaced != blob) else {
+            return;
+        };
+        if !self.cache_only.contains(&replaced)
+            || self.folds_name(&replaced)
+            || super::sim::mutated(super::sim::Mutation::ReplacedFoldKept)
+        {
+            return;
+        }
+        self.cache_only.remove(&replaced);
+        let dropped = self.stored.remove(replaced.key().as_str());
+        assert!(
+            dropped.is_some(),
+            "the cached fold of {state} replaced a fold whose body the thread held"
+        );
+        assert!(
+            self.blob_body(&replaced).is_none(),
+            "a replaced fold's body leaves the thread"
+        );
     }
 
     pub(crate) fn index_blob(&mut self, fact: &StoredFact) {
@@ -566,6 +642,9 @@ impl ThreadState {
         }
         for digest in self.blobs.iter() {
             put("blob", digest);
+        }
+        for digest in self.cache_only.iter() {
+            put("cache_only", digest);
         }
         for ((session, cell), updates) in self.cells.iter() {
             put("cell", &(session.as_ref(), cell, updates));
@@ -905,6 +984,7 @@ impl ThreadState {
             )));
         }
         self.lower(seq, fact, state, row)?;
+        self.named_by_values(fact);
         self.index_blob(fact);
         if let Some(state) = state {
             self.logged(state, seq);
@@ -1116,14 +1196,16 @@ impl ThreadState {
         if key == RESERVED_KEY {
             return self.reserve(value);
         }
+        let replaced = self.hosts.insert(Arc::from(key), value.to_owned());
         if let Some(state) = key
             .strip_prefix(FOLD_SNAPSHOT_KEY)
             .and_then(|rest| rest.strip_prefix('\n'))
         {
             self.uncached.remove(state);
             self.cached.insert(Arc::from(state), row);
+            let replaced = replaced.as_deref().and_then(Self::cached_blob);
+            self.recached(state, replaced, value);
         }
-        self.hosts.insert(Arc::from(key), value.to_owned());
         Ok(())
     }
 

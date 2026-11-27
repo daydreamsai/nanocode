@@ -190,6 +190,7 @@ pub struct ThreadScopeStats {
     pub session_bytes_max: u64,
     pub session_checks: u64,
     pub session_blobs_checked: u64,
+    pub session_stored_bytes_max: u64,
     pub session_caches: u64,
     pub session_rows_bytes: u64,
     pub adoption_bytes: u64,
@@ -263,6 +264,9 @@ impl ThreadScopeStats {
         self.session_bytes_max = self.session_bytes_max.max(other.session_bytes_max);
         self.session_checks += other.session_checks;
         self.session_blobs_checked += other.session_blobs_checked;
+        self.session_stored_bytes_max = self
+            .session_stored_bytes_max
+            .max(other.session_stored_bytes_max);
         self.session_caches += other.session_caches;
         self.session_rows_bytes += other.session_rows_bytes;
         self.adoption_bytes += other.adoption_bytes;
@@ -1260,9 +1264,13 @@ fn held(world: &World, thread: &str, state: &ThreadState, stats: &mut ThreadScop
     let Some(sessions) = sessions.get(thread) else {
         return false;
     };
-    match threadsessions::held(state, thread, sessions) {
-        Ok(checked) => {
-            stats.session_blobs_checked += checked;
+    let checked = threadsessions::held(state, thread, sessions).and_then(|held| {
+        threadsessions::kept(state, thread, &world.rows(thread)).map(|kept| (held, kept))
+    });
+    match checked {
+        Ok((held, kept)) => {
+            stats.session_blobs_checked += held + kept.blobs;
+            stats.session_stored_bytes_max = stats.session_stored_bytes_max.max(kept.bytes);
             true
         }
         Err(error) => {

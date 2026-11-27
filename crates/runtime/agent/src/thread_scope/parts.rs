@@ -20,6 +20,8 @@ struct Meta {
     reserved: Option<Reserved>,
     fact_base: u64,
     legacy: Option<Legacy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache_only: Vec<Digest>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -157,6 +159,7 @@ pub(crate) fn encode(state: &ThreadState, rows: usize) -> Vec<Part> {
             reserved: state.reserved,
             fact_base: state.fact_base,
             legacy: state.legacy,
+            cache_only: state.cache_only.iter().copied().collect(),
         }),
     }];
     assert_eq!(
@@ -311,6 +314,7 @@ pub(crate) fn decode(parts: Vec<Part>) -> Result<ThreadState, StoreError> {
     state.reserved = meta.reserved;
     state.fact_base = meta.fact_base;
     state.legacy = meta.legacy;
+    state.cache_only = meta.cache_only.into_iter().collect();
     for event in ordered("events", pieces.events)? {
         state.events.push_back(Arc::new(event));
     }

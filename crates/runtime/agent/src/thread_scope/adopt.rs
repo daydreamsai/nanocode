@@ -518,6 +518,7 @@ pub(super) async fn adopt(
     unheld(&state, &mut view, &cached);
     keep(&mut state, view);
     bodies(&legacy, &mut state, &cached).await?;
+    state.cache_only = cached.iter().copied().collect();
     state.last_event = last_event;
     state.legacy = Some(Legacy {
         next,

@@ -345,6 +345,8 @@ impl FactSink for Sink<'_> {
         let mut appended = Vec::new();
         if self.staged.state().blob_body(&blob).is_none() {
             self.put_blob(&blob, &value)?;
+        }
+        if !self.staged.state().blob_known(&blob) {
             let marker: StoredFact = Fact::Marker(Marker::Blob {
                 digest: blob,
                 bytes,

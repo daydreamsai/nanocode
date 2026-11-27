@@ -732,6 +732,7 @@ fn sessions(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats)
         && let Some(Ok(log)) = reach(world, &run.node, THREAD)
         && let Some(state) = log.state()
         && let Err(error) = threadsessions::held(&state, THREAD, &sessions)
+            .and_then(|_| threadsessions::kept(&state, THREAD, &world.rows(THREAD)))
     {
         flag(&world.wrong, format!("flips: {error}"));
         return None;
