@@ -64,7 +64,9 @@ impl OnDisk {
 pub const THREAD_PATH: OnDisk =
     OnDisk::new("thread_path", &["resident", "legacy"], Flipped::by("flips"));
 
-pub const ON_DISK: [OnDisk; 1] = [THREAD_PATH];
+pub const ROW_FORMAT: OnDisk = OnDisk::new("row_format", &["1", "2"], Flipped::by("flips"));
+
+pub const ON_DISK: [OnDisk; 2] = [THREAD_PATH, ROW_FORMAT];
 
 #[must_use]
 pub fn registered(name: &str) -> Option<OnDisk> {

@@ -170,6 +170,7 @@ struct CellOrigin {
 }
 
 pub(crate) fn records(seq: u64, body: &str) -> Result<Vec<Record>, StoreError> {
+    let body = nanocode_turnlog::tagged_row(body)?;
     match nanocode_turnlog::standalone_plain(body)? {
         Some(plain) => nanocode_turnlog::decode(&plain),
         None if body.starts_with(UNTAGGED) => nanocode_turnlog::decode(body),

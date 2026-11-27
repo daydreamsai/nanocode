@@ -18,7 +18,7 @@ use nanocode::{
 };
 use nanocode_durability_core::StoreError;
 use nanocode_scope::{Resident, ScopeError, switches};
-use nanocode_turnlog::LogHost;
+use nanocode_turnlog::{Format, Formats, LogHost, sim as log_sim};
 use serde_json::{Map, json};
 
 use crate::{
@@ -35,8 +35,9 @@ const CRASH_PPM: u64 = 250_000;
 const HANDOFF_PPM: u64 = 250_000;
 const LEGACY_PPM: u64 = 500_000;
 const START_LEGACY_PPM: u64 = 500_000;
+const START_STAMPED_PPM: u64 = 500_000;
 const RECENT_ROWS: usize = 1 << 16;
-const DRIVEN: [&str; 1] = ["thread_path"];
+const DRIVEN: [&str; 2] = ["thread_path", "row_format"];
 const RESTARTS: u64 = 2 * ROUNDS.end;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +85,7 @@ pub struct FlipsStats {
     pub flips: u64,
     pub ons: u64,
     pub offs: u64,
+    pub format_flips: u64,
     pub crashes: u64,
     pub handoffs: u64,
     pub acked: u64,
@@ -96,6 +98,7 @@ impl FlipsStats {
         self.flips += other.flips;
         self.ons += other.ons;
         self.offs += other.offs;
+        self.format_flips += other.format_flips;
         self.crashes += other.crashes;
         self.handoffs += other.handoffs;
         self.acked += other.acked;
@@ -128,6 +131,7 @@ struct Run {
     node: Node,
     over: Arc<OneLogOver>,
     generation: u64,
+    stamped: bool,
     turns: u64,
     ids: Vec<String>,
     acked: BTreeMap<String, Acked>,
@@ -159,6 +163,20 @@ fn registered(world: &World) -> bool {
             );
             return false;
         }
+    }
+    let versions: Vec<String> = Formats::all()
+        .iter()
+        .map(|(format, _)| format.version().to_string())
+        .collect();
+    if switches::ROW_FORMAT.settings() != versions.as_slice() {
+        flag(
+            &world.wrong,
+            format!(
+                "flips: the row format switch's settings {:?} are not the registered formats {versions:?}",
+                switches::ROW_FORMAT.settings()
+            ),
+        );
+        return false;
     }
     for path in ThreadPath::ALL {
         if ThreadPath::named(path.setting()) != Some(path) {
@@ -377,7 +395,7 @@ fn agree(
     when: &str,
     stats: &mut FlipsStats,
 ) -> Option<()> {
-    threadcompat::previous(world, THREAD, when)?;
+    formats_agree(world, when)?;
     held(world, run, lossy, when)?;
     let host: Arc<dyn LogHost> = world.host();
     let state = decoded(world)?;
@@ -404,6 +422,85 @@ fn agree(
     }
     stats.checked += 1;
     Some(())
+}
+
+fn formats_agree(world: &World, when: &str) -> Option<()> {
+    let rows = world.rows(THREAD);
+    let mut inner = Vec::with_capacity(rows.len());
+    for (seq, row) in &rows {
+        match nanocode_turnlog::tagged_row(row) {
+            Ok(tagged) => inner.push((*seq, tagged.to_owned())),
+            Err(error) => {
+                flag(
+                    &world.wrong,
+                    format!("flips: {when}, row {seq} opens to no format 1 row: {error}"),
+                );
+                return None;
+            }
+        }
+    }
+    let both = nanocode_turnlog::rows(&rows)
+        .and_then(|stamped| nanocode_turnlog::rows(&inner).map(|tagged| (stamped, tagged)));
+    match both {
+        Ok((stamped, tagged)) => {
+            let differ = stamped.iter().zip(&tagged).find(|(stamped, tagged)| {
+                stamped.seq != tagged.seq || stamped.plain != tagged.plain
+            });
+            if let Some((row, _)) = differ {
+                flag(
+                    &world.wrong,
+                    format!(
+                        "flips: {when}, row {} decodes to other records with its stamp than without",
+                        row.seq
+                    ),
+                );
+                return None;
+            }
+            if stamped.len() != tagged.len() {
+                flag(
+                    &world.wrong,
+                    format!(
+                        "flips: {when}, the log decodes to {} rows with stamps and {} without",
+                        stamped.len(),
+                        tagged.len()
+                    ),
+                );
+                return None;
+            }
+        }
+        Err(error) => {
+            flag(
+                &world.wrong,
+                format!("flips: {when}, the registry refuses the log: {error}"),
+            );
+            return None;
+        }
+    }
+    threadcompat::previous_rows(world, &inner, when)
+}
+
+fn formatted(world: &World, run: &mut Run, stats: &mut FlipsStats) -> Option<()> {
+    run.stamped = !run.stamped;
+    log_sim::force(Some(row_format(run.stamped)));
+    stats.format_flips += 1;
+    agree(
+        world,
+        run,
+        false,
+        &format!(
+            "after a flip to row format {}",
+            row_format(run.stamped).version()
+        ),
+        stats,
+    )
+}
+
+const fn row_format(stamped: bool) -> Format {
+    if stamped {
+        Format::Stamped
+    } else {
+        Format::Tagged
+    }
 }
 
 fn missed(world: &World, node: &Node) -> Option<()> {
@@ -478,7 +575,12 @@ fn moved(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) ->
 
 fn round(rng: &mut Rng, world: &World, run: &mut Run, stats: &mut FlipsStats) -> Option<()> {
     submit(world, run)?;
-    for _ in 0..rng.range(OPS.start, OPS.end) {
+    let ops = rng.range(OPS.start, OPS.end);
+    let flip_at = rng.below(ops);
+    for at in 0..ops {
+        if at == flip_at {
+            formatted(world, run, stats)?;
+        }
         op(rng, world, run)?;
     }
     moved(rng, world, run, stats)?;
@@ -529,6 +631,8 @@ fn started(rng: &mut Rng, world: &World) -> Option<Run> {
         }
     }
     let paths = Arc::new(Switched(AtomicBool::new(rng.chance(START_LEGACY_PPM))));
+    let stamped = rng.chance(START_STAMPED_PPM);
+    log_sim::force(Some(row_format(stamped)));
     let node = world.node("f0");
     publish(world, std::slice::from_ref(&node));
     let over = opened(world, &node, &paths)?;
@@ -537,6 +641,7 @@ fn started(rng: &mut Rng, world: &World) -> Option<Run> {
         node,
         over,
         generation: 0,
+        stamped,
         turns: 0,
         ids,
         acked: BTreeMap::new(),
@@ -571,6 +676,7 @@ fn seeded(seed: u64, mutation: FlipsMutation, time: &Arc<Clock>) -> Outcome {
         stats.acked += run.acked.len() as u64;
     }
     thread_scope_sim::mutate(Mutation::None);
+    log_sim::force(None);
     publish(&world, &[]);
     let mut digest = fnv(FNV_OFFSET, &seed.to_le_bytes());
     for (seq, row) in world.rows(THREAD) {

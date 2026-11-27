@@ -7,7 +7,7 @@ use nanocode_durability_core::StoreError;
 use nanocode_sync::block_on;
 use nanocode_turnlog::{
     Encoder, Format, FormatError, Formats, LogHost, MemoryLog, Point, Record, Release, SCAN_END,
-    Stamp, TurnLog,
+    Stamp, TurnLog, tagged_row,
     sim::{self as log_sim, Mutation as Rule},
 };
 use serde_json::value::RawValue;
@@ -414,6 +414,17 @@ async fn seeded(rng: &mut Rng, stats: &mut FormatsStats) -> Result<u64, String> 
     let plain = current(&rows)
         .map_err(|error| format!("formats: the current registry refuses written rows: {error}"))?;
     let writable = Formats::writable();
+    previous_release(&rows).map_err(|error| {
+        format!(
+            "formats: the previous release refuses a row the turn log's writer wrote at format {}: {error}",
+            writable.version()
+        )
+    })?;
+    let rows = rows
+        .iter()
+        .map(|(seq, body)| tagged_row(body).map(|tagged| (*seq, tagged.to_owned())))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("formats: a written row opens to no format 1 row: {error}"))?;
     let encoder = Encoder::new(writable).map_err(|error| format!("formats: {error}"))?;
     let (at_writable, _) = restamped(&rows, rng, |stamp, body| encoder.row(stamp, body));
     stats.written_rows += at_writable.len() as u64;
@@ -457,6 +468,11 @@ struct Outcome {
 }
 
 fn run_seed(seed: u64, mutation: FormatsMutation) -> Outcome {
+    let time = crate::executor::Clock::new();
+    crate::host::entered(seed, &time, || outcome(seed, mutation))
+}
+
+fn outcome(seed: u64, mutation: FormatsMutation) -> Outcome {
     let mut rng = Rng::derive(seed, "formats");
     let mut stats = FormatsStats {
         seeds: 1,

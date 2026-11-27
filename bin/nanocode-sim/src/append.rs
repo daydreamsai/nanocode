@@ -11,11 +11,14 @@ use nanocode_durability_core::{
 };
 use nanocode_sync::{Atom, block_on};
 use nanocode_turnlog::{
-    LogHost, Point, Record, SqlLog, TurnLog,
+    Format, LogHost, Point, Record, SqlLog, TurnLog,
     sim::{self as log_sim, Mutation as Rule},
 };
 
-use crate::rng::{FNV_OFFSET, Rng, fnv};
+use crate::{
+    executor::Clock,
+    rng::{FNV_OFFSET, Rng, fnv},
+};
 
 const COMMITS: Range<u64> = 1..8;
 const LOST_MAX: u64 = 5;
@@ -26,6 +29,10 @@ const LANDS_PPM: u64 = 600_000;
 const LATER_PPM: u64 = 500_000;
 const READ_FAILS_PPM: u64 = 400_000;
 const CHANGED_PPM: u64 = 150_000;
+const STAMPED_PPM: u64 = 500_000;
+const AFTER_RETRY_PPM: u64 = 300_000;
+const READ_BACK_CALLS: u8 = 1;
+const RETRY_CALLS: u8 = 2;
 const SNAPSHOT_RATIO_NEVER: usize = u32::MAX as usize;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 const LOG_INSERT: &str = "INSERT INTO nanocode_log (scope, seq, body";
@@ -50,14 +57,16 @@ pub enum AppendMutation {
     RetrySkipsReadBack,
     ConflictSkipsReadBack,
     AbandonRunningJob,
+    OwnRowFences,
 }
 
 impl AppendMutation {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::None,
         Self::RetrySkipsReadBack,
         Self::ConflictSkipsReadBack,
         Self::AbandonRunningJob,
+        Self::OwnRowFences,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -72,6 +81,7 @@ impl AppendMutation {
             Self::RetrySkipsReadBack => "retry_skips_read_back",
             Self::ConflictSkipsReadBack => "conflict_skips_read_back",
             Self::AbandonRunningJob => "abandon_running_job",
+            Self::OwnRowFences => "own_row_fences",
         }
     }
 
@@ -89,6 +99,7 @@ impl AppendMutation {
             Self::RetrySkipsReadBack => Rule::RetrySkipsReadBack,
             Self::ConflictSkipsReadBack => Rule::ConflictSkipsReadBack,
             Self::AbandonRunningJob => Rule::AbandonRunningJob,
+            Self::OwnRowFences => Rule::OwnRowFences,
         }
     }
 }
@@ -100,7 +111,10 @@ pub struct AppendStats {
     pub answers_lost: u64,
     pub landed_unanswered: u64,
     pub settled_by_read_back: u64,
-    pub refused_changed: u64,
+    pub settled_changed: u64,
+    pub late_landings: u64,
+    pub stamped_seeds: u64,
+    pub dropped_before: u64,
     pub refused_conflicts: u64,
     pub abandoned_in_flight: u64,
     pub multi_row_appends: u64,
@@ -113,7 +127,10 @@ impl AppendStats {
         self.answers_lost += other.answers_lost;
         self.landed_unanswered += other.landed_unanswered;
         self.settled_by_read_back += other.settled_by_read_back;
-        self.refused_changed += other.refused_changed;
+        self.settled_changed += other.settled_changed;
+        self.late_landings += other.late_landings;
+        self.stamped_seeds += other.stamped_seeds;
+        self.dropped_before += other.dropped_before;
         self.refused_conflicts += other.refused_conflicts;
         self.abandoned_in_flight += other.abandoned_in_flight;
         self.multi_row_appends += other.multi_row_appends;
@@ -123,7 +140,7 @@ impl AppendStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lands {
     Now,
-    AfterReadBack,
+    After(u8),
     Never,
 }
 
@@ -139,7 +156,8 @@ type Rows = BTreeMap<(String, u64), String>;
 struct Flight {
     before: Rows,
     after: Rows,
-    passed: bool,
+    calls: u8,
+    late: bool,
 }
 
 #[derive(Clone, Default)]
@@ -149,6 +167,8 @@ struct Database {
     rows: Rows,
     faults: VecDeque<Fault>,
     flight: Option<Flight>,
+    late: BTreeSet<(String, u64)>,
+    late_landings: u64,
     read_fails: bool,
     pause_next: bool,
     appends: u64,
@@ -198,16 +218,27 @@ fn written_body(statement: &SqlStatement<'_>, data: bool) -> String {
 impl Database {
     fn land(&mut self) {
         match self.flight.take() {
-            Some(flight) if flight.passed => {
+            Some(flight) if flight.calls == 0 && flight.late && self.rows != flight.before => {}
+            Some(flight) if flight.calls == 0 => {
                 assert!(
                     self.rows == flight.before,
                     "no write lands between an unanswered append and its landing"
                 );
+                if flight.late {
+                    self.late_landings += 1;
+                    self.late.extend(
+                        flight
+                            .after
+                            .keys()
+                            .filter(|key| !flight.before.contains_key(*key))
+                            .cloned(),
+                    );
+                }
                 self.rows = flight.after;
             }
             Some(flight) => {
                 self.flight = Some(Flight {
-                    passed: true,
+                    calls: flight.calls - 1,
                     ..flight
                 });
             }
@@ -271,6 +302,14 @@ impl Database {
         if sql.starts_with(LOG_INSERT) {
             let key = (param(statement, 0).to_owned(), number(param(statement, 1)));
             let body = written_body(statement, sql.starts_with(LOG_INSERT_DATA));
+            if rows.contains_key(&key) && self.late.contains(&key) {
+                if !sql.contains(ON_CONFLICT) {
+                    return Err(StoreError::Backend(
+                        "duplicate key value violates unique constraint".to_owned(),
+                    ));
+                }
+                return Ok(Vec::new());
+            }
             if rows.contains_key(&key) {
                 if !sql.contains(ON_CONFLICT) {
                     self.duplicates += 1;
@@ -369,12 +408,13 @@ impl Database {
                 self.landed_unanswered += 1;
                 self.rows = rows;
             }
-            Lands::AfterReadBack => {
+            Lands::After(calls) => {
                 self.landed_unanswered += 1;
                 self.flight = Some(Flight {
                     before: self.rows.clone(),
                     after: rows,
-                    passed: false,
+                    calls,
+                    late: calls > READ_BACK_CALLS,
                 });
             }
             Lands::Never => {}
@@ -527,7 +567,11 @@ impl World {
                 lands: if !rng.chance(LANDS_PPM) {
                     Lands::Never
                 } else if rng.chance(LATER_PPM) {
-                    Lands::AfterReadBack
+                    Lands::After(if rng.chance(AFTER_RETRY_PPM) {
+                        RETRY_CALLS
+                    } else {
+                        READ_BACK_CALLS
+                    })
                 } else {
                     Lands::Now
                 },
@@ -553,7 +597,11 @@ impl World {
                     }
                     return Ok((Ok(seq), changed));
                 }
-                Err(StoreError::Fenced) => return Ok((Err(StoreError::Fenced), changed)),
+                Err(StoreError::Fenced) => {
+                    return Err(format!(
+                        "{key} was refused as Fenced with no other writer: the writer read its own row as a stranger's"
+                    ));
+                }
                 Err(_) if attempt < lost => {
                     if !changed && rng.chance(CHANGED_PPM) {
                         changed = true;
@@ -590,7 +638,7 @@ impl World {
 
     async fn lost_answers(&mut self, rng: &mut Rng) -> Result<(), String> {
         let scope = "scope-lost";
-        let mut log = self
+        let log = self
             .claim(scope)
             .await
             .map_err(|error| format!("claim: {error}"))?;
@@ -605,43 +653,96 @@ impl World {
             let (answer, changed) = self.retried(rng, &log, &key, lost).await?;
             self.faults(&VecDeque::new());
             self.stats.commits += 1;
-            let holding = self.holding(scope, &key)?;
-            match answer {
-                Ok(seq) => {
-                    if seq != expected {
-                        return Err(format!(
-                            "{key} answered seq {seq}, its first attempt wrote at {expected}"
-                        ));
-                    }
-                    if holding != [seq] {
-                        return Err(format!(
-                            "{key} answered seq {seq} but is held by rows {holding:?}"
-                        ));
-                    }
-                    let wanted = key.clone();
-                    let folded = log
-                        .read(move |fold| fold.host(&wanted).map(|raw| raw.get().to_owned()))
-                        .await;
-                    if folded.as_deref() != Some(held.as_str()) {
-                        return Err(format!(
-                            "{key} landed but the writer's fold holds {folded:?}"
-                        ));
-                    }
-                }
-                Err(_) => {
-                    if !changed || holding.len() != 1 {
-                        return Err(format!(
-                            "{key} was refused as Fenced with no other writer (changed={changed}, held by rows {holding:?})"
-                        ));
-                    }
-                    self.stats.refused_changed += 1;
-                    log = self
-                        .claim(scope)
-                        .await
-                        .map_err(|error| format!("reclaim: {error}"))?;
-                }
-            }
+            let Ok(seq) = answer else {
+                return Err(format!("{key} answered {answer:?}"));
+            };
+            self.settled(&log, scope, &key, &held, expected, seq, changed)
+                .await?;
             self.store_clean(&key)?;
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one commit's key, value, first seq, answer and change are what the check compares"
+    )]
+    async fn settled(
+        &mut self,
+        log: &TurnLog,
+        scope: &str,
+        key: &str,
+        held: &str,
+        expected: u64,
+        seq: u64,
+        changed: bool,
+    ) -> Result<(), String> {
+        let holding = self.holding(scope, key)?;
+        if holding != [expected] {
+            return Err(format!(
+                "{key} first wrote at seq {expected} but is held by rows {holding:?}"
+            ));
+        }
+        if changed {
+            let moved = self.holding(scope, &format!("{key}-changed"))?;
+            if moved != [seq] {
+                return Err(format!(
+                    "{key}-changed answered seq {seq} but is held by rows {moved:?}"
+                ));
+            }
+            if seq != expected {
+                self.stats.settled_changed += 1;
+            }
+        } else if seq != expected {
+            return Err(format!(
+                "{key} answered seq {seq}, its first attempt wrote at {expected}"
+            ));
+        }
+        let wanted = key.to_owned();
+        let folded = log
+            .read(move |fold| fold.host(&wanted).map(|raw| raw.get().to_owned()))
+            .await;
+        if folded.as_deref() != Some(held) {
+            return Err(format!(
+                "{key} landed but the writer's fold holds {folded:?}"
+            ));
+        }
+        let next = self.next_seq(scope);
+        let last = commit(log)
+            .await
+            .map_err(|error| format!("a commit after {key}: {error}"))?;
+        if last != next {
+            return Err(format!(
+                "after {key} the writer's next commit answered seq {last}, not {next}, the seq past every landed row"
+            ));
+        }
+        self.stamped(scope)
+    }
+
+    fn stamped(&self, scope: &str) -> Result<(), String> {
+        let rows = nanocode_turnlog::rows(&self.stored(scope))
+            .map_err(|error| format!("the rows of {scope} do not decode: {error}"))?;
+        let mut writers = BTreeSet::new();
+        let mut last = None;
+        for row in &rows {
+            let Some(stamp) = row.stamp else {
+                continue;
+            };
+            writers.insert(stamp.writer());
+            if last.is_some_and(|last| stamp.op() <= last) {
+                return Err(format!(
+                    "row {} of {scope} carries op {} after op {last:?}: an op landed twice or went back",
+                    row.seq,
+                    stamp.op()
+                ));
+            }
+            last = Some(stamp.op());
+        }
+        if writers.len() > 1 {
+            return Err(format!(
+                "the rows of {scope} carry {} writer ids from one writer",
+                writers.len()
+            ));
         }
         Ok(())
     }
@@ -689,6 +790,10 @@ impl World {
             .claim(scope)
             .await
             .map_err(|error| format!("claim abandoned scope: {error}"))?;
+        let early = value(rng);
+        push(&log, "dropped-before", &early).await?;
+        drop(commit(&log));
+        self.stats.dropped_before += 1;
         let first_val = value(rng);
         push(&log, "abandoned", &first_val).await?;
         let before_first = self.next_seq(scope);
@@ -706,6 +811,11 @@ impl World {
             }
         }
         let first_holding = self.holding(scope, "abandoned")?;
+        if self.holding(scope, "dropped-before")? != first_holding {
+            return Err(format!(
+                "a record whose commit was dropped before it ran is not held with the next commit's rows {first_holding:?}"
+            ));
+        }
         if first_holding != [before_first] {
             return Err(format!(
                 "abandoned append did not land at seq {before_first} before its caller dropped (held by {first_holding:?})"
@@ -787,13 +897,20 @@ async fn world(
     model.database.read(|database| {
         stats.landed_unanswered = database.landed_unanswered;
         stats.multi_row_appends = database.multi_row_appends;
+        stats.late_landings = database.late_landings;
     });
     (wrong, stats)
 }
 
 fn run_seed(seed: u64, mutation: AppendMutation) -> Outcome {
+    let time = Clock::new();
+    crate::host::entered(seed, &time, || seeded(seed, mutation))
+}
+
+fn seeded(seed: u64, mutation: AppendMutation) -> Outcome {
     let mut rng = Rng::derive(seed, "append");
     let row_limit = rng.chance(ROW_LIMIT_PPM).then_some(ROW_LIMIT_BYTES);
+    let stamped = rng.chance(STAMPED_PPM);
     let model = Arc::new(Model {
         database: Atom::new(Database {
             migrating: true,
@@ -801,8 +918,11 @@ fn run_seed(seed: u64, mutation: AppendMutation) -> Outcome {
         }),
     });
     log_sim::mutate(mutation.rule());
-    let (wrong, stats) = block_on(world(&model, row_limit, &mut rng));
+    log_sim::force(stamped.then_some(Format::Stamped));
+    let (wrong, mut stats) = block_on(world(&model, row_limit, &mut rng));
+    log_sim::force(None);
     log_sim::mutate(Rule::None);
+    stats.stamped_seeds += u64::from(stamped);
     let digest = model.database.read(|database| {
         database.rows.iter().fold(
             fnv(FNV_OFFSET, &seed.to_le_bytes()),
@@ -818,7 +938,7 @@ fn run_seed(seed: u64, mutation: AppendMutation) -> Outcome {
         digest,
         wrong,
         stats,
-        shape: format!("row_limit={row_limit:?}"),
+        shape: format!("row_limit={row_limit:?} stamped={stamped}"),
     }
 }
 

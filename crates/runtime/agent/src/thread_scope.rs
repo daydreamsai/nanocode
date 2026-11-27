@@ -743,7 +743,13 @@ impl Resident for ThreadFold {
     }
 
     fn foreign(&self, row: &str) -> bool {
-        !row.starts_with(state::UNTAGGED) && !nanocode_turnlog::standalone(row)
+        !nanocode_turnlog::tagged_row(row).is_ok_and(|inner| {
+            inner.starts_with(state::UNTAGGED) || nanocode_turnlog::standalone(inner)
+        })
+    }
+
+    fn stamped(&self) -> bool {
+        !self.untagged()
     }
 
     fn encode(&self, state: &ThreadState) -> Vec<Part> {

@@ -9,7 +9,7 @@ use std::{
 use nanocode_durability_core::{SqlStatement, StoreError};
 use nanocode_partitions::Partition;
 use nanocode_sync::{Atom, Slot, Vector, oneshot, watch};
-use nanocode_turnlog::{Compaction, Rider, Write};
+use nanocode_turnlog::{Compaction, Format, Landed, Rider, Stamps, Write};
 
 use crate::{
     Carry, Committed, Flushed, Resident, ScopeError,
@@ -115,6 +115,13 @@ struct Round<F: Resident> {
     answers: Vec<(oneshot::Sender<Turn<F>>, u64, F::Reply)>,
     rest: Vec<Pending<F>>,
     durable: bool,
+}
+
+struct Sending<'a> {
+    rows: &'a [(u64, String)],
+    stamps: &'a Stamps,
+    op: u64,
+    stamped: bool,
 }
 
 pub(crate) struct Staging<F: Resident> {
@@ -266,6 +273,7 @@ pub(crate) struct Core<F: Resident> {
     pub(crate) since: usize,
     pub(crate) checkpointed: Checkpointed,
     pub(crate) staged: Option<Staging<F>>,
+    pub(crate) stamps: Stamps,
 }
 
 pub(crate) struct Placed {
@@ -887,8 +895,28 @@ impl<F: Resident> Owner<F> {
         }
         let last = round.rest.is_empty();
         let carry = batch.carrying.as_ref().filter(|_| last).map(|(carry, _)| carry);
+        let Some(core) = leading.core.as_mut() else {
+            panic!(
+                "a committing leader of scope {} holds its state",
+                self.scope
+            );
+        };
+        let op = core.stamps.op();
+        let stamped = inner.fold.stamped() && Stamps::format() == Format::Stamped;
+        let sent = if stamped {
+            core.stamps.rows(op, round.rows.clone())
+        } else {
+            round.rows.clone()
+        };
+        let stamps = core.stamps;
+        let sending = Sending {
+            rows: &sent,
+            stamps: &stamps,
+            op,
+            stamped,
+        };
         leading.in_flight = true;
-        let appended = self.append(&round.rows, carry, inner).await;
+        let appended = self.append(&sending, carry, inner).await;
         leading.in_flight = false;
         let carried = match appended {
             Ok(carried) => carried,
@@ -941,26 +969,61 @@ impl<F: Resident> Owner<F> {
 
     async fn append(
         &self,
-        rows: &[(u64, String)],
+        sending: &Sending<'_>,
         carry: Option<&Carry>,
         inner: &Inner<F>,
     ) -> Result<bool, ScopeError> {
+        let rows = sending.rows;
         let (appended, carried) = match carry {
             None => (inner.logs.append.append(&self.scope, rows).await, false),
             Some(carry) => self.carried(rows, carry, inner).await,
         };
-        match appended {
-            Ok(()) => Ok(carried),
-            Err(StoreError::Busy) => Err(ScopeError::Busy),
-            Err(StoreError::Fenced | StoreError::Conflict { .. }) => {
+        let error = match appended {
+            Ok(()) => return Ok(carried),
+            Err(StoreError::Busy) => return Err(ScopeError::Busy),
+            Err(error) => error,
+        };
+        let unknown = !matches!(error, StoreError::Fenced | StoreError::Conflict { .. });
+        let landed = if sending.stamped {
+            self.read_back(sending, inner).await
+        } else {
+            None
+        };
+        match landed {
+            Some(Landed::Sent) => Ok(carried),
+            Some(Landed::Own { op }) if op == sending.op => Ok(carried),
+            Some(Landed::Other) => {
                 self.lose();
                 Err(ScopeError::Lost)
             }
-            Err(_) => {
+            _ if unknown => {
                 self.lose();
                 Err(ScopeError::Uncertain)
             }
+            _ => {
+                self.lose();
+                Err(ScopeError::Lost)
+            }
         }
+    }
+
+    async fn read_back(&self, sending: &Sending<'_>, inner: &Inner<F>) -> Option<Landed> {
+        let (Some((first, _)), Some((last, _))) = (sending.rows.first(), sending.rows.last())
+        else {
+            return Some(Landed::Absent);
+        };
+        assert!(
+            first <= last,
+            "scope {} appends rows in seq order",
+            self.scope
+        );
+        let found = inner
+            .logs
+            .append
+            .scan(&self.scope, *first, last + 1)
+            .await
+            .ok()?;
+        sending.stamps.landed(&found, sending.rows, false).ok()
     }
 
     async fn carried(

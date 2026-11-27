@@ -13,6 +13,7 @@ pub mod parted;
 mod patch;
 mod record;
 pub mod sim;
+mod stamps;
 mod wake;
 mod wake_index;
 mod writer;
@@ -34,6 +35,7 @@ pub use host::{
 pub use image::{FileIo, Header, Image, ImageOptions, Medium};
 pub use patch::apply as apply_patch;
 pub use record::{Outcome, Record, Status, decode, encode};
+pub use stamps::{Landed, Stamps, tagged_row};
 pub use wake::{ArmedWake, Trigger, Unfit, Wake, Wakes, sim as wake_sim};
 pub use wake_index::{Statements, WakeIndex, WakeRider, WakeSummary};
 pub const CHAIN_WINDOW_BYTES: usize = codec::WINDOW;

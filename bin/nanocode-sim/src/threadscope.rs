@@ -190,6 +190,10 @@ pub struct ThreadScopeStats {
     pub session_checks: u64,
     pub session_blobs_checked: u64,
     pub adoption_bytes: u64,
+    pub stamps_settled: u64,
+    pub stamps_uncertain: u64,
+    pub stamps_dropped: u64,
+    pub stamps_fenced: u64,
 }
 
 impl ThreadScopeStats {
@@ -254,6 +258,10 @@ impl ThreadScopeStats {
         self.session_checks += other.session_checks;
         self.session_blobs_checked += other.session_blobs_checked;
         self.adoption_bytes += other.adoption_bytes;
+        self.stamps_settled += other.stamps_settled;
+        self.stamps_uncertain += other.stamps_uncertain;
+        self.stamps_dropped += other.stamps_dropped;
+        self.stamps_fenced += other.stamps_fenced;
     }
 }
 
@@ -363,6 +371,14 @@ impl World {
     pub(crate) fn foreign(&self, thread: &str, seq: u64, records: &[Record]) -> Result<(), StoreError> {
         let row = nanocode_turnlog::encode(records)?;
         block_on(self.reader.append(thread, &[(seq, row)]))
+    }
+
+    pub(crate) fn foreign_row(&self, thread: &str, seq: u64, row: String) -> Result<(), StoreError> {
+        block_on(self.reader.append(thread, &[(seq, row)]))
+    }
+
+    pub(crate) fn tick(&self) -> bool {
+        self.time.advance_to_next()
     }
 
     fn note(&self) -> u64 {
@@ -1735,6 +1751,14 @@ fn seeded(seed: u64, mutation: ThreadScopeMutation, time: &Arc<Clock>) -> Outcom
         crate::threadimport::run(&mut rng, &imports, &mut stats);
         imports.net.nodes.set(Vec::new());
         if let Some(wrong) = imports.wrong.read(Clone::clone) {
+            flag(&world.wrong, wrong);
+        }
+    }
+    if world.wrong.read(Option::is_none) {
+        let stamps = self::world(&mut rng, time);
+        crate::threadstamps::run(&mut rng, &stamps, &mut stats);
+        stamps.net.nodes.set(Vec::new());
+        if let Some(wrong) = stamps.wrong.read(Clone::clone) {
             flag(&world.wrong, wrong);
         }
     }

@@ -349,9 +349,8 @@ impl<H: Sql + ?Sized> SqlLog<H> {
         }
     }
 
-    async fn inserted(
+    fn inserted(
         &self,
-        scope: &str,
         rows: &[(u64, String)],
         results: &[Vec<Vec<Option<String>>>],
     ) -> Result<(), StoreError> {
@@ -371,15 +370,7 @@ impl<H: Sql + ?Sized> SqlLog<H> {
         if crate::sim::mutated(crate::sim::Mutation::ConflictSkipsReadBack) {
             return Ok(());
         }
-        let (Some((first, _)), Some((last, _))) = (rows.first(), rows.last()) else {
-            return Ok(());
-        };
-        let found = self.scanned(scope, *first, last + 1).await?;
-        if crate::codec::same_rows(&found, rows) {
-            Ok(())
-        } else {
-            Err(StoreError::Fenced)
-        }
+        Err(StoreError::Fenced)
     }
 
     async fn scanned(
@@ -609,7 +600,7 @@ impl<H: Sql + Send + Sync + ?Sized> LogHost for SqlLog<H> {
                 .host
                 .transaction("turn_log_append", &statements)
                 .await?;
-            self.inserted(scope, rows, &results).await
+            self.inserted(rows, &results)
         })
     }
 
@@ -651,7 +642,7 @@ impl<H: Sql + Send + Sync + ?Sized> LogHost for SqlLog<H> {
                     let mut statements = self.appending(scope, rows, &compaction, &stored, riders);
                     statements.extend(rider.statements.iter().cloned());
                     let results = self.host.transaction("turn_log_carry", &statements).await?;
-                    self.inserted(scope, rows, &results).await
+                    self.inserted(rows, &results)
                 }
                 Write::Extend(extension) => {
                     let numbers = self.numbers(&extension);
@@ -872,7 +863,7 @@ impl LogHost for MemoryLog {
                 .rev()
             {
                 rows.push((*seq, body.to_string()));
-                if body.starts_with('s') {
+                if crate::stamps::tag(body) == Some(crate::codec::SNAPSHOT) {
                     break;
                 }
             }

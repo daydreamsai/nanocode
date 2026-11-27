@@ -232,7 +232,10 @@ pub(crate) fn resident(
 }
 
 pub(crate) fn previous(world: &World, thread: &str, when: &str) -> Option<()> {
-    let rows = world.rows(thread);
+    previous_rows(world, &world.rows(thread), when)
+}
+
+pub(crate) fn previous_rows(world: &World, rows: &[(u64, String)], when: &str) -> Option<()> {
     if let Some((seq, _)) = rows.iter().find(|(_, body)| {
         !body
             .chars()
@@ -245,7 +248,7 @@ pub(crate) fn previous(world: &World, thread: &str, when: &str) -> Option<()> {
         );
         return None;
     }
-    let decoded = match nanocode_turnlog::rows(&rows) {
+    let decoded = match nanocode_turnlog::rows(rows) {
         Ok(decoded) => decoded,
         Err(error) => {
             flag(

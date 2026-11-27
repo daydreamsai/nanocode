@@ -29,12 +29,14 @@ use crate::{
     },
     fold::{CachedAt, CachedFold, Entry, FOLD_SNAPSHOT_KEY, Page, Section, legacy_name},
     formats::{self, Stamp},
+    stamps::{self, Landed, Stamps},
 };
 
 pub const EVENT_GAP: u64 = 1 << 14;
 pub const SNAPSHOT_RATIO: usize = 2;
 pub const FIRST_ROW: u64 = 1;
 const CLAIM: &str = "writer";
+const SETTLE_ROUNDS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Point {
@@ -739,90 +741,96 @@ impl Unsettled {
             },
         }
     }
+}
 
-    fn written(&self) -> Written<'_> {
-        match self {
-            Self::Appended(rows) => Written::Appended(rows),
-            Self::Extended {
-                cut,
-                row,
-                seq,
-                tail,
-                merged,
-            } => Written::Extended(
-                Extension {
-                    cut: *cut,
-                    row: *row,
-                    seq: *seq,
-                    tail,
-                },
-                *merged,
-            ),
-        }
-    }
+struct Attempt {
+    op: u64,
+    seq: u64,
+    sent: Unsettled,
+    carried: usize,
+}
 
-    fn repeats(
-        &self,
-        extension: Option<Extension<'_>>,
-        merged: Option<usize>,
-        rows: &[(u64, String)],
-    ) -> bool {
-        match (self, extension.zip(merged)) {
-            (Self::Appended(earlier), None) => earlier == rows,
-            (Self::Extended { .. }, Some((extension, merged))) => {
-                *self == Self::of(&Written::Extended(extension, merged))
-            }
-            _ => false,
+impl Attempt {
+    fn rows(&self) -> Range<u64> {
+        match &self.sent {
+            Unsettled::Appended(rows) => match (rows.first(), rows.last()) {
+                (Some((first, _)), Some((last, _))) => *first..last + 1,
+                _ => self.seq..self.seq,
+            },
+            Unsettled::Extended { seq, .. } => *seq..seq + 1,
         }
     }
 }
 
-enum Found {
+enum Settled {
     Absent,
-    Ours,
+    Attempt(usize),
     Other,
+    Unknown,
 }
 
 async fn read_back(
     host: &dyn LogHost,
     scope: &str,
-    written: &Written<'_>,
-) -> Result<Found, StoreError> {
-    let (from, to) = match written {
-        Written::Appended(rows) => match (rows.first(), rows.last()) {
-            (Some((first, _)), Some((last, _))) => (*first, last + 1),
-            _ => return Ok(Found::Absent),
-        },
-        Written::Extended(extension, _) => (extension.seq, extension.seq + 1),
+    stamps: &Stamps,
+    attempts: &[Attempt],
+    unknown: bool,
+) -> Result<Settled, StoreError> {
+    let from = attempts.iter().map(|attempt| attempt.rows().start).min();
+    let to = attempts.iter().map(|attempt| attempt.rows().end).max();
+    let (Some(from), Some(to)) = (from, to) else {
+        return Ok(Settled::Absent);
     };
+    if from >= to {
+        return Ok(Settled::Absent);
+    }
     let found = host.scan(scope, from, to).await?;
-    let ours = match written {
-        Written::Appended(rows) => codec::same_rows(&found, rows),
-        Written::Extended(extension, merged) => match found.as_slice() {
-            [(seq, body)] => {
-                *seq == extension.seq && body.len() == *merged && body.ends_with(extension.tail)
+    if found.is_empty() {
+        return Ok(Settled::Absent);
+    }
+    for (index, attempt) in attempts.iter().enumerate().rev() {
+        let range = attempt.rows();
+        let start = found.partition_point(|(seq, _)| *seq < range.start);
+        let end = found.partition_point(|(seq, _)| *seq < range.end);
+        let within = &found[start..end];
+        let landed = match &attempt.sent {
+            Unsettled::Appended(rows) => stamps.landed(within, rows, unknown)?,
+            Unsettled::Extended {
+                seq, tail, merged, ..
+            } => match within {
+                [(at, body)]
+                    if at == seq && body.len() == *merged && body.ends_with(tail.as_str()) =>
+                {
+                    Landed::Sent
+                }
+                [] => Landed::Absent,
+                _ if unknown => Landed::Unknown,
+                _ => Landed::Other,
+            },
+        };
+        match landed {
+            Landed::Sent => return Ok(Settled::Attempt(index)),
+            Landed::Own { op } => {
+                return Ok(attempts
+                    .iter()
+                    .position(|attempt| attempt.op == op)
+                    .map_or(Settled::Unknown, Settled::Attempt));
             }
-            _ => false,
-        },
-    };
-    Ok(match (found.is_empty(), ours) {
-        (true, _) => Found::Absent,
-        (false, true) => Found::Ours,
-        (false, false) => Found::Other,
+            Landed::Other => return Ok(Settled::Other),
+            Landed::Absent | Landed::Unknown => {}
+        }
+    }
+    Ok(if unknown {
+        Settled::Unknown
+    } else {
+        Settled::Other
     })
 }
 
-async fn landed(
-    host: &dyn LogHost,
-    scope: &str,
-    written: &Written<'_>,
-    error: StoreError,
-) -> Result<(), StoreError> {
-    match read_back(host, scope, written).await {
-        Ok(Found::Ours) => Ok(()),
-        Ok(Found::Other) => Err(StoreError::Fenced),
-        Ok(Found::Absent) | Err(_) => Err(error),
-    }
+fn unsettled(scope: &str, seq: u64) -> StoreError {
+    StoreError::Backend(format!(
+        "turn log {scope} holds rows at seq {seq} that match no append of this writer whose outcome is unknown, so that append's outcome is still unknown"
+    ))
 }
 
 async fn warm(
@@ -1384,6 +1392,36 @@ pub struct Follower {
 }
 
 impl Follower {
+    async fn loading(
+        host: Arc<dyn LogHost>,
+        raw: Arc<dyn LogHost>,
+        scope: Arc<str>,
+        within: Option<Duration>,
+    ) -> Result<Self, StoreError> {
+        let stored = host.load(&scope).await?;
+        let mut follower = Self {
+            decoded: History::default(),
+            first: None,
+            fold: Fold::default(),
+            held: Vec::new(),
+            history: History::default(),
+            host,
+            next: FIRST_ROW,
+            previous: None,
+            raw,
+            scope,
+            snapshot: 0,
+            snapshot_row: None,
+            state: 0,
+            stats: Stats::default(),
+            tail: 0,
+            tail_plain: 0,
+            within,
+        };
+        follower.take(stored)?;
+        Ok(follower)
+    }
+
     pub async fn advance(&mut self) -> Result<usize, StoreError> {
         let from = self.held.first().map_or(self.next, |(seq, _)| *seq);
         let stored = self
@@ -1452,7 +1490,7 @@ impl Follower {
         let mut tail_row = None;
         let last = stored
             .iter()
-            .rposition(|(_, body)| body.starts_with(SNAPSHOT))
+            .rposition(|(_, body)| stamps::tag(body) == Some(SNAPSHOT))
             .map(|index| {
                 let parts = stored[index + 1..]
                     .iter()
@@ -1520,7 +1558,10 @@ impl Follower {
         Ok(tail_row)
     }
 
-    async fn finish(mut self) -> Result<TurnLog, StoreError> {
+    async fn writer(
+        &mut self,
+        riders: mpsc::UnboundedReceiver<Riding>,
+    ) -> Result<Writer, StoreError> {
         let held = std::mem::take(&mut self.held);
         let extensible =
             held.last()
@@ -1536,26 +1577,13 @@ impl Follower {
             (None, first) => first.map_or(0, |first| next - first),
         })
         .map_err(|error| StoreError::Backend(format!("turn log tail row count: {error}")))?;
-        let Self {
-            mut fold,
-            history,
-            host,
-            previous,
-            raw,
-            scope,
-            snapshot,
-            state,
-            mut stats,
-            tail,
-            tail_plain,
-            within,
-            ..
-        } = self;
+        let mut fold = std::mem::take(&mut self.fold);
+        let mut stats = std::mem::take(&mut self.stats);
         let mut chains = Chains::default();
         let forgetting = fold.forgetting();
         warm(
-            &*host,
-            &scope,
+            &*self.host,
+            &self.scope,
             &mut fold,
             &mut stats,
             &mut chains,
@@ -1564,9 +1592,45 @@ impl Follower {
         .await?;
         fold.reopen(EVENT_GAP);
         let floor = Some(fold.last_event());
+        Ok(Writer {
+            bases: BTreeMap::new(),
+            buffer: Vec::new(),
+            chains: Chains::default(),
+            check: self.snapshot,
+            collectable: BTreeSet::new(),
+            fenced: false,
+            floor,
+            fold,
+            history: std::mem::take(&mut self.history),
+            next,
+            previous: self.previous.take(),
+            riders,
+            snapshot: self.snapshot,
+            state: self.state,
+            stats,
+            tail: self.tail,
+            tail_plain: self.tail_plain,
+            tail_row,
+            tail_rows,
+            tails: BTreeMap::new(),
+            tried: None,
+            attempts: Vec::new(),
+            stamps: Stamps::new(0),
+        })
+    }
+
+    async fn finish(mut self) -> Result<TurnLog, StoreError> {
         let (riding, riders) = mpsc::unbounded_channel();
+        let writer = self.writer(riders).await?;
+        let Self {
+            host,
+            raw,
+            scope,
+            within,
+            ..
+        } = self;
         let writing = Writing {
-            host: Arc::clone(&host),
+            host,
             limit: None,
             max_tail: None,
             chain_bytes: None,
@@ -1575,30 +1639,7 @@ impl Follower {
             rows: None,
             scope: Arc::clone(&scope),
             whole: false,
-            writer: Writer {
-                bases: BTreeMap::new(),
-                buffer: Vec::new(),
-                chains: Chains::default(),
-                check: snapshot,
-                collectable: BTreeSet::new(),
-                fenced: false,
-                floor,
-                fold,
-                history,
-                next,
-                previous,
-                riders,
-                snapshot,
-                state,
-                stats,
-                tail,
-                tail_plain,
-                tail_row,
-                tail_rows,
-                tails: BTreeMap::new(),
-                tried: None,
-                unsettled: None,
-            },
+            writer,
         };
         let (letters, received) = mpsc::unbounded_channel();
         let serving: StoreFuture<'static, ()> = Box::pin(serve(writing, received));
@@ -1622,6 +1663,24 @@ impl Writer {
             return Err(StoreError::Fenced);
         }
         Ok(())
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Record) -> bool) {
+        let mut at = 0;
+        let mut removed = Vec::new();
+        self.buffer.retain(|record| {
+            let kept = keep(record);
+            if !kept {
+                removed.push(at);
+            }
+            at += 1;
+            kept
+        });
+        for attempt in &mut self.attempts {
+            let below = removed.iter().filter(|at| **at < attempt.carried).count();
+            assert!(below <= attempt.carried, "an attempt carried what it lost");
+            attempt.carried -= below;
+        }
     }
 }
 
@@ -1653,7 +1712,8 @@ struct Writer {
     tail_rows: usize,
     tails: BTreeMap<String, u64>,
     tried: Option<(usize, usize)>,
-    unsettled: Option<Unsettled>,
+    attempts: Vec<Attempt>,
+    stamps: Stamps,
 }
 
 type Job = Box<dyn for<'a> FnOnce(&'a mut Writing) -> StoreFuture<'a, ()> + Send>;
@@ -1705,28 +1765,7 @@ impl TurnLog {
         let within = crate::bound::own(&*host);
         let raw = host;
         let host = crate::bound::bounded(&raw, within);
-        let stored = host.load(&scope).await?;
-        let mut follower = Follower {
-            decoded: History::default(),
-            first: None,
-            fold: Fold::default(),
-            held: Vec::new(),
-            history: History::default(),
-            host,
-            next: FIRST_ROW,
-            previous: None,
-            raw,
-            scope,
-            snapshot: 0,
-            snapshot_row: None,
-            state: 0,
-            stats: Stats::default(),
-            tail: 0,
-            tail_plain: 0,
-            within,
-        };
-        follower.take(stored)?;
-        Ok(follower)
+        Follower::loading(host, raw, scope, within).await
     }
 
     fn configure(&self, change: impl FnOnce(&mut Writing) + Send + 'static) {
@@ -2686,7 +2725,7 @@ impl Writing {
         }
         writer.fold.apply(&record, None)?;
         if let Record::Checkpoint { state, .. } = &record {
-            writer.buffer.retain(
+            writer.retain(
                 |buffered| !matches!(buffered, Record::Checkpoint { state: other, .. } if other == state),
             );
         }
@@ -2705,12 +2744,12 @@ impl Writing {
             _ => None,
         });
         if let Some(from) = withdrawn {
-            writer.buffer.retain(
+            writer.retain(
                 |record| !matches!(record, Record::Fact { seq: fact, .. } if *fact >= from),
             );
             writer.fold.withdraw_facts(from);
         }
-        writer.buffer.retain(|record| match record {
+        writer.retain(|record| match record {
             Record::Admitted { turn: admitted, .. } => admitted != turn,
             Record::Event { seq: event, .. } => *event != seq,
             _ => true,
@@ -2720,7 +2759,7 @@ impl Writing {
 
     pub fn unwake(&mut self, key: &str, held: Option<crate::ArmedWake>) {
         let writer = &mut self.writer;
-        writer.buffer.retain(|record| match record {
+        writer.retain(|record| match record {
             Record::Armed { key: buffered, .. }
             | Record::Disarmed { key: buffered, .. }
             | Record::Fired { key: buffered, .. }
@@ -2773,6 +2812,98 @@ impl Writing {
         point: Point,
         rider: Option<Rider<'_>>,
     ) -> Result<(u64, bool), StoreError> {
+        for _ in 0..SETTLE_ROUNDS {
+            if let Some(answer) = self.attempted(point, rider).await? {
+                return Ok(answer);
+            }
+        }
+        panic!(
+            "turn log {} settled an earlier append twice in one commit; a settle leaves no earlier append",
+            self.scope
+        )
+    }
+
+    async fn settle(&mut self, carried: usize) -> Result<(), StoreError> {
+        let mut follower = Follower::loading(
+            Arc::clone(&self.host),
+            Arc::clone(&self.host),
+            Arc::clone(&self.scope),
+            None,
+        )
+        .await?;
+        let (_, riders) = mpsc::unbounded_channel();
+        let fresh = follower.writer(riders).await?;
+        let mut old = std::mem::replace(&mut self.writer, fresh);
+        assert!(
+            carried <= old.buffer.len(),
+            "a landed append carried records still buffered"
+        );
+        let writer = &mut self.writer;
+        std::mem::swap(&mut writer.riders, &mut old.riders);
+        writer.stamps = old.stamps;
+        writer.stats = old.stats;
+        writer.collectable = std::mem::take(&mut old.collectable);
+        writer.fold.reopen(
+            old.fold
+                .last_event()
+                .saturating_sub(writer.fold.last_event()),
+        );
+        writer.floor = Some(writer.fold.last_event());
+        assert!(
+            writer.fold.last_event() >= old.fold.last_event(),
+            "a settled writer hands out no event seq it handed out before"
+        );
+        for record in old.buffer.split_off(carried) {
+            self.push(record)?;
+        }
+        Ok(())
+    }
+
+    async fn earlier(&mut self) -> Result<Option<(u64, bool)>, StoreError> {
+        if self.writer.attempts.is_empty() {
+            return Ok(None);
+        }
+        if crate::sim::mutated(crate::sim::Mutation::RetrySkipsReadBack) {
+            self.writer.attempts.clear();
+            return Ok(None);
+        }
+        let attempts = &self.writer.attempts;
+        let settled = read_back(
+            &*self.host,
+            &self.scope,
+            &self.writer.stamps,
+            attempts,
+            true,
+        )
+        .await?;
+        match settled {
+            Settled::Absent => Ok(None),
+            Settled::Attempt(index) => {
+                let (seq, carried) = (attempts[index].seq, attempts[index].carried);
+                self.settle(carried).await?;
+                assert!(
+                    self.writer.attempts.is_empty(),
+                    "a settled writer holds no earlier append"
+                );
+                Ok(self.writer.buffer.is_empty().then_some((seq, false)))
+            }
+            Settled::Other => {
+                self.writer.fenced = true;
+                Err(StoreError::Fenced)
+            }
+            Settled::Unknown => Err(unsettled(&self.scope, self.writer.next)),
+        }
+    }
+
+    async fn attempted(
+        &mut self,
+        point: Point,
+        rider: Option<Rider<'_>>,
+    ) -> Result<Option<(u64, bool)>, StoreError> {
+        self.writer.live()?;
+        if let Some(answer) = self.earlier().await? {
+            return Ok(Some(answer));
+        }
         let writer = &mut self.writer;
         writer.live()?;
         let revived = writer.fold.revive(&writer.buffer);
@@ -3045,6 +3176,13 @@ impl Writing {
             (None, None) => std::mem::take(&mut body),
         };
         let written_len = written.len();
+        let op = writer.stamps.op();
+        let written = if snapshot.is_some() {
+            written
+        } else {
+            writer.stamps.row(op, written)
+        };
+        let buffered = writer.buffer.len();
         let stored = stored(seq, written, self.limit)?;
         let bytes = stored.iter().map(|(_, body)| body.len()).sum::<usize>();
         let archived = match (&snapshot, &writer.previous) {
@@ -3117,22 +3255,6 @@ impl Writing {
             dropped,
             superseded: &superseded,
         };
-        let repeated = match self.writer.unsettled.take() {
-            Some(_) if crate::sim::mutated(crate::sim::Mutation::RetrySkipsReadBack) => false,
-            Some(earlier) => match read_back(&*self.host, &self.scope, &earlier.written()).await {
-                Ok(Found::Absent) => false,
-                Ok(Found::Ours) if earlier.repeats(extension, merged, &appended) => true,
-                Ok(Found::Ours | Found::Other) => {
-                    self.writer.fenced = true;
-                    return Err(StoreError::Fenced);
-                }
-                Err(error) => {
-                    self.writer.unsettled = Some(earlier);
-                    return Err(error);
-                }
-            },
-            None => false,
-        };
         let mut riding = Vec::new();
         while let Ok(ride) = self.writer.riders.try_recv() {
             riding.push(ride);
@@ -3164,8 +3286,10 @@ impl Writing {
                 let _ = sender.send(rode);
             }
         };
+        let host = Arc::clone(&self.host);
+        let scope = Arc::clone(&self.scope);
         let (carried, extended) = {
-            let carrying = rider.filter(|_| !repeated).and_then(|rider| {
+            let carrying = rider.and_then(|rider| {
                 let write = match extension {
                     Some(extension) => Write::Extend(extension),
                     None => Write::Append {
@@ -3173,50 +3297,51 @@ impl Writing {
                         compaction: compaction.clone(),
                     },
                 };
-                self.host.carry(&self.scope, write, rider)
+                host.carry(&scope, write, rider)
             });
             let carried = carrying.is_some();
             let (rodes, extended, done) = match carrying {
                 Some(carrying) => (rodes, extension.and(merged), carrying.await),
-                None if repeated => {
-                    answer(rodes, false);
-                    (Vec::new(), extension.and(merged), Ok(()))
-                }
                 None => {
                     answer(rodes, false);
-                    let extending =
-                        extension.and_then(|extension| self.host.extend(&self.scope, extension));
+                    let extending = extension.and_then(|extension| host.extend(&scope, extension));
                     let extended = extending.is_some().then_some(merged).flatten();
                     let done = match extending {
                         Some(extending) => extending.await,
                         None if archived.is_some() || !superseded.is_empty() => {
-                            self.host
-                                .append_compacting(&self.scope, &appended, compaction)
-                                .await
+                            host.append_compacting(&scope, &appended, compaction).await
                         }
-                        None => self.host.append(&self.scope, &appended).await,
+                        None => host.append(&scope, &appended).await,
                     };
                     (Vec::new(), extended, done)
                 }
             };
             let done = match done {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    self.writer.attempts.clear();
+                    Ok(None)
+                }
                 Err(error) => {
                     let written = match extension.zip(extended) {
                         Some((extension, merged)) => Written::Extended(extension, merged),
                         None => Written::Appended(&appended[..]),
                     };
-                    let landed = landed(&*self.host, &self.scope, &written, error).await;
-                    match &landed {
-                        Err(StoreError::Fenced) => self.writer.fenced = true,
-                        Err(_) => self.writer.unsettled = Some(Unsettled::of(&written)),
-                        Ok(()) => {}
-                    }
-                    landed
+                    self.writer.attempts.push(Attempt {
+                        op,
+                        seq,
+                        sent: Unsettled::of(&written),
+                        carried: buffered,
+                    });
+                    self.landed(error).await
                 }
             };
-            answer(rodes, done.is_ok());
-            done?;
+            answer(rodes, matches!(done, Ok(None)));
+            if let Some(index) = done? {
+                let landed = &self.writer.attempts[index];
+                let (seq, carried) = (landed.seq, landed.carried);
+                self.settle(carried).await?;
+                return Ok(self.writer.buffer.is_empty().then_some((seq, false)));
+            }
             (carried, extended)
         };
         drop(appended);
@@ -3342,7 +3467,40 @@ impl Writing {
             Point::Progress => writer.stats.progress += 1,
             Point::Recovery => writer.stats.recoveries += 1,
         }
-        Ok((seq, carried && explicit))
+        Ok(Some((seq, carried && explicit)))
+    }
+
+    async fn landed(&mut self, error: StoreError) -> Result<Option<usize>, StoreError> {
+        let fenced = matches!(error, StoreError::Fenced);
+        let unknown = self.writer.attempts.len() > 1;
+        let settled = read_back(
+            &*self.host,
+            &self.scope,
+            &self.writer.stamps,
+            &self.writer.attempts,
+            unknown,
+        )
+        .await;
+        let current = self.writer.attempts.len() - 1;
+        match settled {
+            Ok(Settled::Attempt(index)) if index == current => {
+                self.writer.attempts.clear();
+                Ok(None)
+            }
+            Ok(Settled::Attempt(index)) => Ok(Some(index)),
+            Ok(Settled::Other) => {
+                self.writer.attempts.clear();
+                self.writer.fenced = true;
+                Err(StoreError::Fenced)
+            }
+            Ok(Settled::Absent) if fenced => {
+                self.writer.attempts.clear();
+                self.writer.fenced = true;
+                Err(error)
+            }
+            Ok(Settled::Unknown) => Err(unsettled(&self.scope, self.writer.next)),
+            Ok(Settled::Absent) | Err(_) => Err(error),
+        }
     }
 }
 

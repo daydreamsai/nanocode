@@ -10,7 +10,7 @@ use std::{
 use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_partitions::{Partition, Row};
 use nanocode_sync::{Atom, OrdMap, Slot, Vector, oneshot, watch};
-use nanocode_turnlog::{LogHost, SCAN_END};
+use nanocode_turnlog::{LogHost, SCAN_END, Stamps};
 
 use crate::{
     Adopted, Carry, Committed, Flushed, Part, Policy, Resident, ScopeError,
@@ -685,6 +685,7 @@ impl<F: Resident> Inner<F> {
             since: tail.len(),
             checkpointed,
             staged: None,
+            stamps: Stamps::new(placed.epoch),
         };
         let owner = Arc::new(Owner::new(scope, placed, core, weight, self.touch()));
         if let Some((rows, bytes)) = adopted {

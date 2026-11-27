@@ -85,6 +85,10 @@ pub trait Resident: Send + Sync + 'static {
         0
     }
 
+    fn stamped(&self) -> bool {
+        false
+    }
+
     fn foreign(&self, _row: &str) -> bool {
         false
     }
