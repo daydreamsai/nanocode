@@ -1,5 +1,7 @@
+mod admission;
 mod checkpoint;
 mod lease;
+mod meter;
 mod owner;
 mod route;
 mod scopes;
@@ -16,6 +18,7 @@ pub use checkpoint::{
     Checkpoints, Fence, Listing, Manifest, MemoryCheckpoints, MemoryStats, Written, assemble, digest,
 };
 pub use lease::{Leases, PartedLeases};
+pub use meter::{Usage, Work};
 pub use route::Route;
 pub use scopes::{ClaimHook, Clock, Reached, Routed, Scope, Scopes, Stats, Wiring};
 pub use sql::SqlCheckpoints;
@@ -50,6 +53,7 @@ pub struct Policy {
     pub checkpoint_ms: u64,
     pub resident_bytes_max: usize,
     pub forward_ms: u64,
+    pub admit_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

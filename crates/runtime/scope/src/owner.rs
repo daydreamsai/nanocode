@@ -14,6 +14,7 @@ use nanocode_turnlog::{Compaction, Rider, Write};
 use crate::{
     Carry, Committed, Flushed, Resident, ScopeError,
     checkpoint::{Fence, Listing, Manifest, Written, digest},
+    meter::Tally,
     scopes::Inner,
     sim::{self, Mutation},
 };
@@ -267,6 +268,12 @@ pub(crate) struct Core<F: Resident> {
     pub(crate) staged: Option<Staging<F>>,
 }
 
+pub(crate) struct Placed {
+    pub(crate) part: Partition,
+    pub(crate) epoch: u64,
+    pub(crate) tally: Arc<Tally>,
+}
+
 pub(crate) struct Owner<F: Resident> {
     pub(crate) scope: Arc<str>,
     pub(crate) part: Partition,
@@ -276,6 +283,7 @@ pub(crate) struct Owner<F: Resident> {
     queue: Atom<Queue<F>>,
     core: Slot<Core<F>>,
     pub(crate) used: AtomicU64,
+    pub(crate) tally: Arc<Tally>,
     weight: AtomicUsize,
     buffered: AtomicUsize,
 }
@@ -340,12 +348,12 @@ impl<F: Resident> Drop for Leading<'_, F> {
 impl<F: Resident> Owner<F> {
     pub(crate) fn new(
         scope: Arc<str>,
-        part: Partition,
-        epoch: u64,
+        placed: Placed,
         core: Core<F>,
         weight: usize,
         used: u64,
     ) -> Self {
+        let Placed { part, epoch, tally } = placed;
         let published = Published {
             state: Arc::clone(&core.state),
             next: core.next,
@@ -363,6 +371,7 @@ impl<F: Resident> Owner<F> {
             }),
             core: Slot::new(Some(core)),
             used: AtomicU64::new(used),
+            tally,
             weight: AtomicUsize::new(weight),
             buffered: AtomicUsize::new(0),
         }
@@ -645,7 +654,7 @@ impl<F: Resident> Owner<F> {
             holder: inner.leases.node().to_owned(),
         };
         let written = inner
-            .checkpoints
+            .meter
             .write(&fence, &manifest, &listing, &fresh)
             .await;
         match written {
@@ -937,7 +946,7 @@ impl<F: Resident> Owner<F> {
         inner: &Inner<F>,
     ) -> Result<bool, ScopeError> {
         let (appended, carried) = match carry {
-            None => (inner.log.append(&self.scope, rows).await, false),
+            None => (inner.logs.append.append(&self.scope, rows).await, false),
             Some(carry) => self.carried(rows, carry, inner).await,
         };
         match appended {
@@ -973,7 +982,7 @@ impl<F: Resident> Owner<F> {
             statements: &statements,
         };
         let split = sim::mutated(Mutation::RiderSplit);
-        if split && let Err(error) = inner.log.append(&self.scope, rows).await {
+        if split && let Err(error) = inner.logs.append.append(&self.scope, rows).await {
             return (Err(error), false);
         }
         let write = Write::Append {
@@ -984,10 +993,10 @@ impl<F: Resident> Owner<F> {
                 superseded: &[],
             },
         };
-        match inner.log.carry(&self.scope, write, rider) {
+        match inner.logs.append.carry(&self.scope, write, rider) {
             Some(carrying) => (carrying.await, true),
             None if split => (Ok(()), false),
-            None => (inner.log.append(&self.scope, rows).await, false),
+            None => (inner.logs.append.append(&self.scope, rows).await, false),
         }
     }
 }

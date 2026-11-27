@@ -303,6 +303,7 @@ pub fn check(root: &Path) -> std::io::Result<Vec<String>> {
     problems.extend(mutexes(root)?);
     problems.extend(opens(root)?);
     problems.extend(crate::tidy_switches::check(root)?);
+    problems.extend(crate::tidy_meter::check(root)?);
     let base = djs_base::make();
     let base_dir = root.join(BASE_DIR);
     for file in djs_base::stale(&base_dir, &base) {

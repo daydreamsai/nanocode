@@ -16,7 +16,8 @@ use crate::{
     Adopted, Carry, Committed, Flushed, Part, Policy, Resident, ScopeError,
     checkpoint::{Checkpoints, Listing, Manifest, digest},
     lease::Leases,
-    owner::{Ask, Chain, Checkpointed, Core, Life, Owner, Turn, Why},
+    meter::{Logs, Meter, Usage},
+    owner::{Ask, Chain, Checkpointed, Core, Life, Owner, Placed, Turn, Why},
     route::Route,
     sim::{self, Mutation},
 };
@@ -54,6 +55,9 @@ pub struct Stats {
     pub forward_ms_max: u64,
     pub forwards_busy: u64,
     pub forwards_unreachable: u64,
+    pub usage: Usage,
+    pub admissions: u64,
+    pub admissions_busy: u64,
 }
 
 pub struct Wiring<F: Resident> {
@@ -152,9 +156,9 @@ impl<V: Clone + Send + 'static> Flights<V> {
 
 pub(crate) struct Inner<F: Resident> {
     pub(crate) fold: Arc<F>,
-    pub(crate) log: Arc<dyn LogHost>,
+    pub(crate) logs: Logs,
     pub(crate) leases: Arc<dyn Leases>,
-    pub(crate) checkpoints: Arc<dyn Checkpoints>,
+    pub(crate) meter: Arc<Meter>,
     route: Arc<dyn Route<F>>,
     pub(crate) policy: Policy,
     pub(crate) clock: Clock,
@@ -272,6 +276,10 @@ impl<F: Resident> Scope<F> {
         self.owner.watch()
     }
 
+    pub fn usage(&self) -> Usage {
+        self.owner.tally.usage()
+    }
+
     pub async fn send(&self, command: F::Command) -> Result<Committed<F::Reply>, ScopeError> {
         self.committed(command, Ask::Send).await
     }
@@ -341,12 +349,13 @@ impl<F: Resident> Scopes<F> {
             wiring.policy.checkpoint_rows > 0,
             "a scope checkpoints after at least one row"
         );
+        let (meter, logs) = Meter::new(wiring.log, wiring.checkpoints, wiring.policy.admit_ms);
         Self {
             inner: Arc::new(Inner {
                 fold: wiring.fold,
-                log: wiring.log,
+                logs,
                 leases: wiring.leases,
-                checkpoints: wiring.checkpoints,
+                meter,
                 route: wiring.route,
                 policy: wiring.policy,
                 clock: wiring.clock,
@@ -428,11 +437,23 @@ impl<F: Resident> Scopes<F> {
 
     pub fn stats(&self) -> Stats {
         let (residents, bytes) = self.inner.weighed();
+        let admitted = self.inner.meter.admission().admitted_so_far();
         Stats {
             residents,
             resident_bytes: bytes,
+            usage: self.inner.meter.usage(),
+            admissions: admitted.admissions,
+            admissions_busy: admitted.busy,
             ..self.inner.stats.read(|stats| *stats)
         }
+    }
+
+    pub fn history(&self) -> Arc<dyn LogHost> {
+        Arc::clone(&self.inner.logs.history)
+    }
+
+    pub fn read_capacity(&self) -> u32 {
+        self.inner.meter.admission().capacity()
     }
 }
 
@@ -470,6 +491,7 @@ impl<F: Resident> Inner<F> {
                 residents.remove(&owner.scope);
             }
         });
+        self.meter.leave(&owner.scope, &owner.tally);
     }
 
     fn forget(&self, part: Partition) {
@@ -506,10 +528,13 @@ impl<F: Resident> Inner<F> {
                 }
             },
         };
-        let owner = self
-            .loads
-            .run(scope, || self.load(scope, part, epoch))
-            .await?;
+        let owner = if sim::mutated(Mutation::ColdLoadDuplicated) {
+            self.load(scope, part, epoch).await?
+        } else {
+            self.loads
+                .run(scope, || self.load(scope, part, epoch))
+                .await?
+        };
         self.make_room(scope).await;
         Ok(self.local(owner))
     }
@@ -570,12 +595,58 @@ impl<F: Resident> Inner<F> {
         if let Some(hook) = &self.claimed {
             hook(Arc::from(scope)).await?;
         }
+        let name: Arc<str> = Arc::from(scope);
+        let tally = self.meter.enter(&name);
+        let owner = match self.meter.admission().admitted(self.read(scope)).await {
+            Ok(loaded) => {
+                let placed = Placed {
+                    part,
+                    epoch,
+                    tally: Arc::clone(&tally),
+                };
+                self.resident_from(name, placed, loaded).await
+            }
+            Err(error) => Err(error),
+        };
+        if owner.is_err() {
+            self.meter.leave(scope, &tally);
+        }
+        owner
+    }
+
+    async fn read(&self, scope: &str) -> Result<Loaded<F::State>, ScopeError> {
         let manifest = if sim::mutated(Mutation::CheckpointIndexesOnly) {
             None
         } else {
-            self.checkpoints.latest(scope).await?
+            self.meter.latest(scope).await?
         };
         let now = (self.clock)();
+        match manifest {
+            Some(manifest) => {
+                let (state, next, checkpointed, parts) = self.restore(scope, manifest, now).await?;
+                let tail = self.logs.load.scan(scope, next, SCAN_END).await?;
+                match tail.iter().find(|(_, row)| self.fold.foreign(row)) {
+                    None => Ok(Loaded {
+                        state,
+                        next,
+                        checkpointed,
+                        parts,
+                        tail,
+                        adopted: None,
+                    }),
+                    Some((seq, _)) => self.adopted(scope, now, Some(*seq)).await,
+                }
+            }
+            None => self.adopted(scope, now, None).await,
+        }
+    }
+
+    async fn resident_from(
+        &self,
+        scope: Arc<str>,
+        placed: Placed,
+        loaded: Loaded<F::State>,
+    ) -> Result<Arc<Owner<F>>, ScopeError> {
         let Loaded {
             mut state,
             next,
@@ -583,24 +654,7 @@ impl<F: Resident> Inner<F> {
             parts,
             tail,
             adopted,
-        } = match manifest {
-            Some(manifest) => {
-                let (state, next, checkpointed, parts) = self.restore(scope, manifest, now).await?;
-                let tail = self.log.scan(scope, next, SCAN_END).await?;
-                match tail.iter().find(|(_, row)| self.fold.foreign(row)) {
-                    None => Loaded {
-                        state,
-                        next,
-                        checkpointed,
-                        parts,
-                        tail,
-                        adopted: None,
-                    },
-                    Some((seq, _)) => self.adopted(scope, now, Some(*seq)).await?,
-                }
-            }
-            None => self.adopted(scope, now, None).await?,
-        };
+        } = loaded;
         let mut at = next;
         for (seq, row) in &tail {
             if *seq < at {
@@ -625,14 +679,7 @@ impl<F: Resident> Inner<F> {
             checkpointed,
             staged: None,
         };
-        let owner = Arc::new(Owner::new(
-            Arc::from(scope),
-            part,
-            epoch,
-            core,
-            weight,
-            self.touch(),
-        ));
+        let owner = Arc::new(Owner::new(scope, placed, core, weight, self.touch()));
         if let Some((rows, bytes)) = adopted {
             if !sim::mutated(Mutation::AdoptionSkipsCheckpoint) {
                 owner.seal(self).await?;
@@ -655,7 +702,7 @@ impl<F: Resident> Inner<F> {
         foreign: Option<u64>,
     ) -> Result<Loaded<F::State>, ScopeError> {
         let fresh = Checkpointed::empty(now);
-        let (state, next, adopted) = match (self.fold.adopt(&self.log, scope).await?, foreign) {
+        let (state, next, adopted) = match (self.fold.adopt(&self.logs.adopt, scope).await?, foreign) {
             (None, None) => (self.fold.empty(), self.fold.first_row(), None),
             (None, Some(seq)) => {
                 return Err(ScopeError::Store(StoreError::Backend(format!(
@@ -675,7 +722,7 @@ impl<F: Resident> Inner<F> {
                 (state, next, Some((rows, bytes)))
             }
         };
-        let tail = self.log.scan(scope, next, SCAN_END).await?;
+        let tail = self.logs.load.scan(scope, next, SCAN_END).await?;
         Ok(Loaded {
             state,
             next,
@@ -700,7 +747,7 @@ impl<F: Resident> Inner<F> {
         }
         let digests: BTreeSet<String> = manifest.parts.iter().map(|(_, at)| at.clone()).collect();
         let wanted: Vec<String> = digests.iter().cloned().collect();
-        let found = self.checkpoints.parts(&wanted).await?;
+        let found = self.meter.parts(scope, &wanted).await?;
         let mut bodies: OrdMap<String, String> = OrdMap::default();
         for (at, body) in found {
             if digest(&body) != at {

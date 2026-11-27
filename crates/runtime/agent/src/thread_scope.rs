@@ -781,6 +781,7 @@ impl Resident for ThreadFold {
 pub struct ThreadLogs {
     scopes: Scopes<ThreadFold>,
     host: Arc<dyn LogHost>,
+    history: Arc<dyn LogHost>,
     policy: ThreadPolicy,
     fold: Arc<ThreadFold>,
     paths: Option<Arc<dyn ThreadPaths>>,
@@ -793,12 +794,17 @@ impl ThreadLogs {
             wiring.fold.policy.recent_rows >= wiring.policy.checkpoint_rows,
             "a thread keeps at least the rows its owner may hold uncommitted"
         );
+        let host = Arc::clone(&wiring.log);
+        let fold = Arc::clone(&wiring.fold);
+        let policy = wiring.fold.policy;
+        let scopes = Scopes::new(wiring);
         Self {
-            host: Arc::clone(&wiring.log),
-            policy: wiring.fold.policy,
-            fold: Arc::clone(&wiring.fold),
+            history: scopes.history(),
+            host,
+            policy,
+            fold,
             paths: None,
-            scopes: Scopes::new(wiring),
+            scopes,
         }
     }
 
@@ -849,7 +855,7 @@ impl ThreadLogs {
     pub(crate) async fn reach(&self, thread: &str) -> Result<ThreadLog, ScopeError> {
         Ok(ThreadLog {
             reached: self.scopes.get(thread).await?,
-            host: Arc::clone(&self.host),
+            host: Arc::clone(&self.history),
             scope: Arc::from(thread),
             policy: self.policy,
         })

@@ -475,6 +475,12 @@ default_table='
 1 canary_scope_staged_published canary:16 --scenario scope --mutation staged_published
 1 canary_scope_flush_skips_staged canary:16 --scenario scope --mutation flush_skips_staged
 1 canary_scope_rider_split canary:16 --scenario scope --mutation rider_split
+1 canary_scope_meter_skips_writer_task canary:16 --scenario scope --mutation meter_skips_writer_task
+4 admission pass --scenario admission
+1 admission_twice pass --scenario admission --twice
+1 canary_admission_admission_unbounded canary:8 --scenario admission --mutation admission_unbounded
+1 canary_admission_cold_load_duplicated canary:8 --scenario admission --mutation cold_load_duplicated
+1 canary_admission_meter_skips_writer_task canary:8 --scenario admission --mutation meter_skips_writer_task
 4 thread_scope pass --scenario thread_scope
 1 thread_scope_twice pass --scenario thread_scope --twice
 1 canary_thread_scope_part_dropped canary:16 --scenario thread_scope --mutation part_dropped

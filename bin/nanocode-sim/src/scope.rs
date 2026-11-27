@@ -18,7 +18,7 @@ use nanocode_partitions::{Partition, Row};
 use nanocode_scope::{
     Carry, Checkpoints, Committed, Fence, Flushed, Listing, Manifest, MemoryCheckpoints, Part,
     PartedLeases, Policy, Reached, Resident, Route, Routed, Scope, ScopeError, Scopes, Stats,
-    Wiring, Written,
+    Wiring, Work, Written,
     sim::{self as scope_sim, Mutation},
 };
 use nanocode_sync::{Atom, Signal, block_on};
@@ -50,6 +50,7 @@ const CHECKPOINT_ROWS: Range<u64> = 3..10;
 const CHECKPOINT_MS: u64 = 4_000;
 const RESIDENT_BYTES: Range<u64> = 200..700;
 const FORWARD_MS: u64 = 50;
+const ADMIT_MS: u64 = TTL_MS;
 const WATCHDOG_MS: u64 = 1_000;
 const READ_WAIT_MS: u64 = 1_000;
 const VALUES_MAX: u64 = 3;
@@ -317,6 +318,7 @@ struct Witness {
     store: Arc<ModelParts>,
     wrong: Wrong,
     stale: AtomicU64,
+    calls: AtomicU64,
 }
 
 impl Witness {
@@ -370,6 +372,7 @@ impl Checkpoints for Witness {
         &'a self,
         scope: &'a str,
     ) -> StoreFuture<'a, Result<Option<Manifest>, StoreError>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         self.inner.latest(scope)
     }
 
@@ -377,6 +380,7 @@ impl Checkpoints for Witness {
         &'a self,
         digests: &'a [String],
     ) -> StoreFuture<'a, Result<Vec<(String, String)>, StoreError>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         self.inner.parts(digests)
     }
 
@@ -387,6 +391,7 @@ impl Checkpoints for Witness {
         listing: &'a Listing,
         parts: &'a [(String, String)],
     ) -> StoreFuture<'a, Result<Written, StoreError>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
             let previous = self.inner.manifests(&manifest.scope).last().cloned();
             let row = self.store.fence_row(fence.part);
@@ -432,7 +437,47 @@ impl Checkpoints for Witness {
 
 type Landed = (String, u64, Vec<(&'static str, Vec<String>)>);
 
+#[derive(Default)]
+struct Served {
+    reads: [AtomicU64; 3],
+    writes: [AtomicU64; 3],
+}
+
+impl Served {
+    fn add(counters: &[AtomicU64; 3], rows: &[(u64, String)]) {
+        let bytes: usize = rows.iter().map(|(_, body)| body.len()).sum();
+        let [calls, counted, sized] = counters;
+        calls.fetch_add(1, Ordering::Relaxed);
+        counted.fetch_add(rows.len() as u64, Ordering::Relaxed);
+        sized.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn read(&self, answer: &Result<Vec<(u64, String)>, StoreError>) {
+        Self::add(&self.reads, answer.as_ref().map_or(&[], Vec::as_slice));
+    }
+
+    fn work(counters: &[AtomicU64; 3]) -> (u64, u64, u64) {
+        let [calls, rows, bytes] = counters;
+        (
+            calls.load(Ordering::Relaxed),
+            rows.load(Ordering::Relaxed),
+            bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+const fn counted(work: Work) -> (u64, u64, u64) {
+    (work.calls, work.rows, work.bytes)
+}
+
+fn summed(works: &[Work]) -> (u64, u64, u64) {
+    works.iter().fold((0, 0, 0), |(calls, rows, bytes), work| {
+        (calls + work.calls, rows + work.rows, bytes + work.bytes)
+    })
+}
+
 struct Tap {
+    served: Served,
     riders: Atom<Vec<Landed>>,
     log: Arc<PartedLog<ModelParts>>,
     witness: Arc<Witness>,
@@ -491,7 +536,9 @@ impl LogHost for Tap {
         to: u64,
     ) -> StoreFuture<'a, Result<Vec<(u64, String)>, StoreError>> {
         Box::pin(async move {
-            let rows = self.log.scan(scope, from, to).await?;
+            let answer = self.log.scan(scope, from, to).await;
+            self.served.read(&answer);
+            let rows = answer?;
             self.check(scope, from, &rows);
             Ok(rows)
         })
@@ -501,7 +548,11 @@ impl LogHost for Tap {
         &'a self,
         scope: &'a str,
     ) -> StoreFuture<'a, Result<Vec<(u64, String)>, StoreError>> {
-        self.log.load(scope)
+        Box::pin(async move {
+            let answer = self.log.load(scope).await;
+            self.served.read(&answer);
+            answer
+        })
     }
 
     fn append<'a>(
@@ -513,7 +564,9 @@ impl LogHost for Tap {
             if let Some(signal) = self.gated(scope) {
                 signal.wait().await;
             }
-            self.log.append(scope, rows).await
+            let answer = self.log.append(scope, rows).await;
+            Served::add(&self.served.writes, rows);
+            answer
         })
     }
 
@@ -530,6 +583,7 @@ impl LogHost for Tap {
             if let Some(signal) = self.gated(scope) {
                 signal.wait().await;
             }
+            Served::add(&self.served.writes, rows);
             if rows.is_empty() {
                 flag(
                     &self.wrong,
@@ -608,6 +662,7 @@ struct World {
     policy: Policy,
     count: NonZeroU32,
     scopes: Vec<String>,
+    metered: Atom<Vec<(Scopes<Buckets>, Arc<Tap>)>>,
 }
 
 impl World {
@@ -621,6 +676,7 @@ impl World {
         );
         let leases = PartedLeases::new(Arc::clone(&log), name, TTL_MS);
         let tap = Arc::new(Tap {
+            served: Served::default(),
             riders: Atom::default(),
             log: Arc::clone(&log),
             witness: Arc::clone(&self.witness),
@@ -639,6 +695,8 @@ impl World {
             clock: Arc::new(move || local.load(Ordering::Relaxed)),
             claimed: None,
         });
+        self.metered
+            .update(|metered| metered.push((scopes.clone(), Arc::clone(&tap))));
         Node {
             name: name.to_owned(),
             log,
@@ -666,6 +724,43 @@ impl World {
 
     fn head(&self, scope: &str) -> u64 {
         self.rows(scope).last().map_or(0, |(seq, _)| seq + 1)
+    }
+}
+
+fn metered(world: &World) {
+    let mut checkpoint_calls = 0;
+    for (scopes, tap) in world.metered.read(Clone::clone) {
+        let usage = scopes.stats().usage;
+        checkpoint_calls += usage.checkpoint.calls;
+        let reads = summed(&[usage.load, usage.adopt, usage.history]);
+        let served = Served::work(&tap.served.reads);
+        if reads != served {
+            flag(
+                &world.wrong,
+                format!(
+                    "I16: the meter counts reads (calls, rows, bytes) {reads:?} where the host served {served:?}"
+                ),
+            );
+        }
+        let writes = counted(usage.append);
+        let served = Served::work(&tap.served.writes);
+        if writes != served {
+            flag(
+                &world.wrong,
+                format!(
+                    "I16: the meter counts appends (calls, rows, bytes) {writes:?} where the host served {served:?}"
+                ),
+            );
+        }
+    }
+    let served = world.witness.calls.load(Ordering::Relaxed);
+    if checkpoint_calls != served {
+        flag(
+            &world.wrong,
+            format!(
+                "I16: the meter counts {checkpoint_calls} checkpoint store calls where the store served {served}"
+            ),
+        );
     }
 }
 
@@ -1553,6 +1648,7 @@ fn seeded(seed: u64, mutation: ScopeMutation, time: &Arc<Clock>) -> Outcome {
         store: Arc::clone(&store),
         wrong: Arc::clone(&wrong),
         stale: AtomicU64::new(0),
+        calls: AtomicU64::new(0),
     });
     let policy = Policy {
         checkpoint_rows: usize::try_from(rng.range(CHECKPOINT_ROWS.start, CHECKPOINT_ROWS.end))
@@ -1561,6 +1657,7 @@ fn seeded(seed: u64, mutation: ScopeMutation, time: &Arc<Clock>) -> Outcome {
         resident_bytes_max: usize::try_from(rng.range(RESIDENT_BYTES.start, RESIDENT_BYTES.end))
             .expect("a byte bound fits"),
         forward_ms: FORWARD_MS,
+        admit_ms: ADMIT_MS,
     };
     let world = World {
         time: Arc::clone(time),
@@ -1575,6 +1672,7 @@ fn seeded(seed: u64, mutation: ScopeMutation, time: &Arc<Clock>) -> Outcome {
         scopes: (0..rng.range(SCOPES.start, SCOPES.end))
             .map(|at| format!("scope-{at}"))
             .collect(),
+        metered: Atom::default(),
     };
     let mut nodes: Vec<Node> = (0..rng.range(NODES.start, NODES.end))
         .map(|at| world.node(&format!("n{at}g0")))
@@ -1619,6 +1717,7 @@ fn seeded(seed: u64, mutation: ScopeMutation, time: &Arc<Clock>) -> Outcome {
         }
     }
     scope_sim::mutate(Mutation::None);
+    metered(&world);
     for node in &nodes {
         let runtime = node.scopes.stats();
         stats.runtime(&runtime);

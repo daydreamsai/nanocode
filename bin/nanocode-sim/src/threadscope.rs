@@ -59,6 +59,7 @@ const CHECKPOINT_MS: u64 = 1_500;
 const RESIDENT_BYTES: Range<u64> = 1_500..12_000;
 const PART_ROWS: Range<u64> = 1..5;
 const FORWARD_MS: u64 = 50;
+const ADMIT_MS: u64 = TTL_MS;
 const SESSIONS: u64 = 2;
 const CELLS: u64 = 3;
 const RELEASE_PPM: u64 = 40_000;
@@ -1421,6 +1422,7 @@ pub(crate) fn world(rng: &mut Rng, time: &Arc<Clock>) -> World {
         resident_bytes_max: usize::try_from(rng.range(RESIDENT_BYTES.start, RESIDENT_BYTES.end))
             .expect("a byte bound fits"),
         forward_ms: FORWARD_MS,
+        admit_ms: ADMIT_MS,
     };
     let rows = policy.checkpoint_rows as u64;
     let thread = ThreadPolicy {

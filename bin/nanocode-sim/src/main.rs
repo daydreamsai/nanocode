@@ -1,3 +1,4 @@
+mod admission;
 mod agents;
 #[cfg(unix)]
 mod alloc;
@@ -94,6 +95,7 @@ mod sync;
 mod tasks;
 mod tidy;
 mod tidy_switches;
+mod tidy_meter;
 mod turnlog;
 mod turns;
 mod wakes;
@@ -151,6 +153,7 @@ use crate::{
     onelogfacts::{OneLogFactsMutation, OneLogFactsStats},
     partitions::{PartitionsMutation, PartitionsStats},
     pgpool::{PgPoolMutation, PgPoolStats},
+    admission::{AdmissionMutation, AdmissionStats},
     flips::{FlipsMutation, FlipsStats},
     plog::{PlogMutation, PlogStats},
     repocache::{RepoCacheMutation, RepoCacheStats},
@@ -244,6 +247,7 @@ enum Scenario {
     ThreadScope,
     PgPool,
     Flips,
+    Admission,
 }
 
 struct Args {
@@ -317,6 +321,7 @@ struct Args {
     thread_scope: ThreadScopeMutation,
     pg_pool: PgPoolMutation,
     flips: FlipsMutation,
+    admission: AdmissionMutation,
     #[cfg(unix)]
     alloc: alloc::AllocMutation,
     #[cfg(unix)]
@@ -331,7 +336,7 @@ type Caught = BTreeMap<Invariant, (u64, u64, (u64, u64))>;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|request_close|steer_carry|antigravity_durable|inbox_stress|capture|executor|dns|board|board_shards|controlplane|cost|plog|secrets|wakes|imports|facts|backend_facts|hand_router|workspace_host|board_sync|dispatcher|board_steer|board_brief|workspace_fs|repo_cache|workspace_sql|git_remote|workspace_stack|workspace_crash|live|partitions|lease|durable|scale|gc_unwind|interp_drop|held_await|holds|slog|append|one_log_facts|migrated|kv_lease|scope|thread_scope|pg_pool|flips] [--ops N] [--twice] [--seed-lines] [--jobs N] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--chain-bytes BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
+        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|request_close|steer_carry|antigravity_durable|inbox_stress|capture|executor|dns|board|board_shards|controlplane|cost|plog|secrets|wakes|imports|facts|backend_facts|hand_router|workspace_host|board_sync|dispatcher|board_steer|board_brief|workspace_fs|repo_cache|workspace_sql|git_remote|workspace_stack|workspace_crash|live|partitions|lease|durable|scale|gc_unwind|interp_drop|held_await|holds|slog|append|one_log_facts|migrated|kv_lease|scope|thread_scope|pg_pool|flips|admission] [--ops N] [--twice] [--seed-lines] [--jobs N] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--chain-bytes BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
        websocket: [--mutation {}]
        http_server: [--mutation {}]
        alloc: [--mutation overstate_size|forget_free|scribble]
@@ -383,7 +388,8 @@ fn usage() -> ExitCode {
        scope: [--mutation {}]
        thread_scope: [--mutation {}]
        pg_pool: [--mutation {}]
-       flips: [--mutation {}]",
+       flips: [--mutation {}]
+       admission: [--mutation {}]",
         Mutation::names(),
         TurnMutation::names(),
         onelog::PROTECTIONS.join("|"),
@@ -437,7 +443,8 @@ fn usage() -> ExitCode {
         ScopeMutation::names(),
         ThreadScopeMutation::names(),
         PgPoolMutation::names(),
-        FlipsMutation::names()
+        FlipsMutation::names(),
+        AdmissionMutation::names()
     );
     ExitCode::from(2)
 }
@@ -541,6 +548,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut thread_scope = ThreadScopeMutation::NONE;
     let mut pg_pool = PgPoolMutation::None;
     let mut flips = FlipsMutation::None;
+    let mut admission = AdmissionMutation::NONE;
     #[cfg(unix)]
     let mut capture = capture::CaptureMutation::None;
     #[cfg(target_os = "linux")]
@@ -651,6 +659,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
                     "holds" => Scenario::Holds,
                     "pg_pool" => Scenario::PgPool,
                     "flips" => Scenario::Flips,
+                    "admission" => Scenario::Admission,
                     "slog" => Scenario::Slog,
                     "append" => Scenario::Append,
                     "one_log_facts" => Scenario::OneLogFacts,
@@ -759,6 +768,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         }
         (Scenario::PgPool, Some(name)) => pg_pool = PgPoolMutation::parse(name)?,
         (Scenario::Flips, Some(name)) => flips = FlipsMutation::parse(name)?,
+        (Scenario::Admission, Some(name)) => admission = AdmissionMutation::parse(name)?,
         (Scenario::Slog, Some(name)) => slog = SlogMutation::parse(name)?,
         (Scenario::Append, Some(name)) => append = AppendMutation::parse(name)?,
         (Scenario::OneLogFacts, Some(name)) => {
@@ -859,6 +869,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         thread_scope,
         pg_pool,
         flips,
+        admission,
         #[cfg(unix)]
         alloc,
         #[cfg(unix)]
@@ -1032,6 +1043,9 @@ fn scenario_replay(seed: u64, args: &Args) -> String {
     }
     if args.scenario == Scenario::Flips {
         return flips::replay(seed, args.flips);
+    }
+    if args.scenario == Scenario::Admission {
+        return admission::replay(seed, args.admission);
     }
     if args.scenario == Scenario::Slog {
         return slog::replay(seed, args.slog);
@@ -1445,6 +1459,7 @@ fn mutations() -> ExitCode {
     add("thread_scope", ThreadScopeMutation::names());
     add("pg_pool", PgPoolMutation::names());
     add("flips", FlipsMutation::names());
+    add("admission", AdmissionMutation::names());
     #[cfg(unix)]
     {
         add("alloc", alloc::AllocMutation::names());
@@ -1537,6 +1552,7 @@ struct Totals {
     thread_scope_totals: ThreadScopeStats,
     pg_pool_totals: PgPoolStats,
     flips_totals: FlipsStats,
+    admission_totals: AdmissionStats,
     #[cfg(unix)]
     capture_totals: capture::CaptureStats,
     #[cfg(target_os = "linux")]
@@ -1609,6 +1625,7 @@ impl Totals {
         self.thread_scope_totals.add(&other.thread_scope_totals);
         self.pg_pool_totals.add(&other.pg_pool_totals);
         self.flips_totals.add(&other.flips_totals);
+        self.admission_totals.add(&other.admission_totals);
         #[cfg(unix)]
         self.capture_totals.add(&other.capture_totals);
         #[cfg(target_os = "linux")]
@@ -1995,6 +2012,13 @@ fn judge_one(seed: u64, args: &Args, totals: &mut Totals, caught: &mut Caught) -
             args.options.verbose,
             &mut totals.flips_totals,
         ),
+        Scenario::Admission => admission::judge(
+            seed,
+            args.admission,
+            args.twice,
+            args.options.verbose,
+            &mut totals.admission_totals,
+        ),
         Scenario::Slog => slog::judge(
             seed,
             args.slog,
@@ -2241,6 +2265,7 @@ fn main() -> ExitCode {
             && args.thread_scope != ThreadScopeMutation::NONE)
         || (args.scenario == Scenario::PgPool && args.pg_pool != PgPoolMutation::None)
         || (args.scenario == Scenario::Flips && args.flips != FlipsMutation::None)
+        || (args.scenario == Scenario::Admission && args.admission != AdmissionMutation::NONE)
         || (args.scenario == Scenario::Slog && args.slog != SlogMutation::None)
         || (args.scenario == Scenario::Append && args.append != AppendMutation::None)
         || (args.scenario == Scenario::OneLogFacts
@@ -2350,6 +2375,7 @@ fn main() -> ExitCode {
         thread_scope_totals,
         pg_pool_totals,
         flips_totals,
+        admission_totals,
         #[cfg(unix)]
         capture_totals,
         #[cfg(target_os = "linux")]
@@ -2859,6 +2885,16 @@ fn main() -> ExitCode {
             args.twice,
             args.flips,
             &flips_totals,
+        );
+    }
+    if args.scenario == Scenario::Admission {
+        return admission::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.admission,
+            &admission_totals,
         );
     }
     if args.scenario == Scenario::Executor {

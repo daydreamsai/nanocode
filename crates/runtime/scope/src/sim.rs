@@ -18,10 +18,13 @@ pub enum Mutation {
     StagedPublished,
     FlushSkipsStaged,
     RiderSplit,
+    MeterSkipsWriterTask,
+    AdmissionUnbounded,
+    ColdLoadDuplicated,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::CheckpointIndexesOnly,
         Self::ReadThroughWriter,
         Self::PublishBeforeCommit,
@@ -35,6 +38,13 @@ impl Mutation {
         Self::StagedPublished,
         Self::FlushSkipsStaged,
         Self::RiderSplit,
+        Self::MeterSkipsWriterTask,
+    ];
+
+    pub const ADMISSION: [Self; 3] = [
+        Self::AdmissionUnbounded,
+        Self::ColdLoadDuplicated,
+        Self::MeterSkipsWriterTask,
     ];
 
     #[must_use]
@@ -55,6 +65,9 @@ impl Mutation {
             Self::StagedPublished => "staged_published",
             Self::FlushSkipsStaged => "flush_skips_staged",
             Self::RiderSplit => "rider_split",
+            Self::MeterSkipsWriterTask => "meter_skips_writer_task",
+            Self::AdmissionUnbounded => "admission_unbounded",
+            Self::ColdLoadDuplicated => "cold_load_duplicated",
         }
     }
 
@@ -62,6 +75,7 @@ impl Mutation {
     pub fn parse(name: &str) -> Option<Self> {
         std::iter::once(Self::None)
             .chain(Self::ALL)
+            .chain(Self::ADMISSION)
             .find(|mutation| mutation.name() == name)
     }
 }
