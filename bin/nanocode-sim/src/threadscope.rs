@@ -26,7 +26,7 @@ use nanocode_durability_core::{
     VALUE_INLINE_BYTES, commit_fact, fold_facts,
 };
 use nanocode_scope::{
-    Checkpoints, Committed, Manifest, MemoryCheckpoints, Part, PartedLeases, Policy, Resident,
+    Checkpoints, ClaimHook, Committed, Manifest, MemoryCheckpoints, Part, PartedLeases, Policy, Resident,
     Route, ScopeError, Wiring,
     sim::{self as scope_sim, Mutation as ScopeMutation},
 };
@@ -308,6 +308,14 @@ pub(crate) struct World {
 
 impl World {
     pub(crate) fn node(&self, name: &str) -> Node {
+        self.node_wrapped(name, |log| (log, None))
+    }
+
+    pub(crate) fn node_wrapped(
+        &self,
+        name: &str,
+        wrap: impl FnOnce(Arc<dyn LogHost>) -> (Arc<dyn LogHost>, Option<ClaimHook>),
+    ) -> Node {
         let db = Arc::clone(&self.db);
         let log = Arc::new(
             PartedLog::fenced(Arc::clone(&self.store), self.count, name)
@@ -316,15 +324,16 @@ impl World {
         );
         let leases = PartedLeases::new(Arc::clone(&log), name, TTL_MS);
         let db = Arc::clone(&self.db);
+        let (log, claimed) = wrap(log as Arc<dyn LogHost>);
         let logs = ThreadLogs::new(Wiring {
             fold: Arc::new(ThreadFold::new(self.thread)),
-            log: log as Arc<dyn LogHost>,
+            log,
             leases: Arc::new(leases),
             checkpoints: Arc::clone(&self.witness) as Arc<dyn Checkpoints>,
             route: Arc::clone(&self.net) as Arc<dyn Route<ThreadFold>>,
             policy: self.policy,
             clock: Arc::new(move || db.load(Ordering::Relaxed)),
-            claimed: None,
+            claimed,
         });
         Node {
             name: name.to_owned(),
@@ -1610,6 +1619,14 @@ fn seeded(seed: u64, mutation: ThreadScopeMutation, time: &Arc<Clock>) -> Outcom
         let tail = self::world(&mut rng, time);
         crate::threadtail::run(&mut rng, &tail);
         if let Some(wrong) = tail.wrong.read(Clone::clone) {
+            flag(&world.wrong, wrong);
+        }
+    }
+    if world.wrong.read(Option::is_none) {
+        let opens = self::world(&mut rng, time);
+        crate::threadopens::run(&mut rng, &opens);
+        opens.net.nodes.set(Vec::new());
+        if let Some(wrong) = opens.wrong.read(Clone::clone) {
             flag(&world.wrong, wrong);
         }
     }

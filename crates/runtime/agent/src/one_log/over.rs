@@ -15,7 +15,10 @@ use nanocode_tool_host::{
     embedded::HostFuture,
     hold::{HoldCall, HoldLedger, LedgerError, Running},
 };
-use nanocode_turnlog::{Answer, ArmedWake, EffectClass, Point, Resumption, Wake, WakeRider};
+use nanocode_turnlog::{
+    Answer, ArmedWake, EffectClass, Point, Resumption, SCAN_END, Wake, WakeRider,
+    adopt::{self, Reading},
+};
 use serde_json::{Map, Value, value::RawValue};
 
 use super::{Exported, Fire, Heard, Imported, OneLog, Policy, WakeError};
@@ -271,6 +274,9 @@ impl OneLogOver {
     }
 
     async fn fresh(&self) -> Result<Serving, StoreError> {
+        if sim::mutated(sim::Mutation::OpenPerRequest) {
+            adopt::read_all(&self.logs.host(), &self.thread, Reading::Below(SCAN_END)).await?;
+        }
         let serving = self.current();
         let fresh = match (&serving, self.logs.path(&self.thread)) {
             (Serving::Legacy(_), ThreadPath::Legacy) => return Ok(serving),
