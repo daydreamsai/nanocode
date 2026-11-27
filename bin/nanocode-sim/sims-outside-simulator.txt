@@ -1,0 +1,7 @@
+crates/core/python-capi/src/module.rs 2
+crates/integrations/agent-host/src/cell_journals.rs 2
+crates/integrations/tool-runtime/src/remote/accept/registry.rs 2
+crates/nanocode/src/lib.rs 5
+crates/runtime/agent/src/one_log/wakes.rs 1
+crates/runtime/subagents/src/board.rs 1
+crates/runtime/subagents/src/pool.rs 1
