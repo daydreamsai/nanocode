@@ -114,6 +114,13 @@ fn abandoned(staged: &mut Staged, call_id: &str) -> Result<Option<ToolOutput>, S
 
 impl ThreadHolds {
     pub fn new(log: Arc<ThreadLog>, effects: Effects) -> Result<Self, StoreError> {
+        Self::sharing(log, Arc::new(Atom::new(Effects::builtin().merged(effects))))
+    }
+
+    pub(crate) fn sharing(
+        log: Arc<ThreadLog>,
+        effects: Arc<Atom<Effects>>,
+    ) -> Result<Self, StoreError> {
         if log.state().is_none() {
             return Err(refused(nanocode_scope::ScopeError::Routed {
                 holder: log.holder().unwrap_or_default().to_owned(),
@@ -121,7 +128,7 @@ impl ThreadHolds {
         }
         Ok(Self {
             log,
-            effects: Arc::new(Atom::new(Effects::builtin().merged(effects))),
+            effects,
             resolved: Atom::default(),
             owed: Atom::new(false),
         })

@@ -16,7 +16,7 @@ use nanocode_tool_host::{
     hold::{HoldCall, HoldLedger, LedgerError, Running},
 };
 use nanocode_turnlog::{
-    Answer, ArmedWake, EffectClass, Point, Resumption, SCAN_END, Wake, WakeRider,
+    Answer, ArmedWake, EffectClass, Effects, Point, Resumption, SCAN_END, Wake, WakeRider,
     adopt::{self, Reading},
 };
 use serde_json::{Map, Value, value::RawValue};
@@ -42,6 +42,7 @@ pub struct OneLogOver {
     serving: Atom<Serving>,
     store: ThreadStore,
     journals: ThreadJournals,
+    effects: Arc<Atom<Effects>>,
     index: Atom<Option<Arc<dyn WakeRider>>>,
     durable: AtomicBool,
     deferred: AtomicBool,
@@ -57,7 +58,7 @@ struct Bound {
 
 struct Old {
     log: Arc<OneLog>,
-    resident: Arc<Bound>,
+    resident: Option<Arc<Bound>>,
     uncertain: Vec<String>,
 }
 
@@ -80,13 +81,6 @@ impl Serving {
             (Self::Resident(one), Self::Resident(two)) => Arc::ptr_eq(one, two),
             (Self::Legacy(one), Self::Legacy(two)) => Arc::ptr_eq(one, two),
             (Self::Resident(_) | Self::Legacy(_), _) => false,
-        }
-    }
-
-    fn resident(&self) -> &Arc<Bound> {
-        match self {
-            Self::Resident(bound) => bound,
-            Self::Legacy(old) => &old.resident,
         }
     }
 }
@@ -176,35 +170,84 @@ async fn handed_over(log: &OneLog) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn bound(
+    log: Arc<ThreadLog>,
+    thread: &str,
+    policy: &Policy,
+    effects: &Arc<Atom<Effects>>,
+) -> Result<Bound, StoreError> {
+    let holds = ThreadHolds::sharing(Arc::clone(&log), Arc::clone(effects))?;
+    Ok(Bound {
+        turns: ThreadTurns::new(Arc::clone(&log), policy.restarts)?,
+        wakes: ThreadWakes::new(Arc::clone(&log), thread, policy.wakes_max)?,
+        holds,
+        log,
+    })
+}
+
+async fn unclaimed(logs: &ThreadLogs, thread: &str) -> Result<(), StoreError> {
+    match logs.scopes().drain(thread).await {
+        Ok(_) | Err(ScopeError::Moved) => Ok(()),
+        Err(error) => Err(refused(error)),
+    }
+}
+
+async fn held(logs: &ThreadLogs, thread: &str) -> Result<(), StoreError> {
+    match logs.scopes().hold(thread).await {
+        Ok(_) | Err(ScopeError::Routed { .. } | ScopeError::Busy) => {}
+        Err(error) => return Err(refused(error)),
+    }
+    unclaimed(logs, thread).await
+}
+
+async fn writer(
+    logs: &ThreadLogs,
+    thread: &str,
+    policy: &Policy,
+    effects: &Atom<Effects>,
+) -> Result<Arc<OneLog>, StoreError> {
+    let mut policy = policy.clone();
+    policy.effects = effects.read(Clone::clone);
+    OneLog::open(logs.scopes().legacy(), thread, policy).await
+}
+
 impl OneLog {
     pub async fn over(
         logs: Arc<ThreadLogs>,
         thread: &str,
         policy: &Policy,
     ) -> Result<Arc<OneLogOver>, StoreError> {
-        let log = Arc::new(logs.reach(thread).await.map_err(refused)?);
-        let binding = Arc::new(ThreadBinding::new(
-            Arc::clone(&logs),
-            thread,
-            Arc::clone(&log),
-        ));
-        let holds = ThreadHolds::new(Arc::clone(&log), policy.effects.clone())?;
-        let store = ThreadStore::rebinding(Arc::clone(&binding));
-        let journals = ThreadJournals::rebinding(Arc::clone(&binding), holds.effects());
-        let bound = Bound {
-            turns: ThreadTurns::new(Arc::clone(&log), policy.restarts)?,
-            wakes: ThreadWakes::new(Arc::clone(&log), thread, policy.wakes_max)?,
-            holds,
-            log,
+        let effects = Arc::new(Atom::new(Effects::builtin().merged(policy.effects.clone())));
+        let (log, serving) = if logs.path(thread) == ThreadPath::Legacy {
+            if sim::mutated(sim::Mutation::LegacyOpenClaims) {
+                drop(logs.reach(thread).await.map_err(refused)?);
+            }
+            held(&logs, thread).await?;
+            let log = writer(&logs, thread, policy, &effects).await?;
+            let uncertain = log.uncertain_holds().await;
+            let old = Old {
+                log,
+                resident: None,
+                uncertain,
+            };
+            (None, Serving::Legacy(Arc::new(old)))
+        } else {
+            let log = Arc::new(logs.reach(thread).await.map_err(refused)?);
+            let bound = bound(Arc::clone(&log), thread, policy, &effects)?;
+            (Some(log), Serving::Resident(Arc::new(bound)))
         };
+        let binding = Arc::new(ThreadBinding::new(Arc::clone(&logs), thread, log));
+        let store = ThreadStore::rebinding(Arc::clone(&binding));
+        let journals = ThreadJournals::rebinding(Arc::clone(&binding), Arc::clone(&effects));
         Ok(Arc::new_cyclic(|this| OneLogOver {
             logs,
             thread: thread.to_owned(),
             policy: policy.clone(),
             binding,
-            serving: Atom::new(Serving::Resident(Arc::new(bound))),
+            serving: Atom::new(serving),
             store,
             journals,
+            effects,
             index: Atom::new(None),
             durable: AtomicBool::new(false),
             deferred: AtomicBool::new(false),
@@ -275,20 +318,23 @@ impl OneLogOver {
 
     async fn fresh(&self) -> Result<Serving, StoreError> {
         if sim::mutated(sim::Mutation::OpenPerRequest) {
-            adopt::read_all(&self.logs.host(), &self.thread, Reading::Below(SCAN_END)).await?;
+            adopt::read_all(
+                &self.logs.scopes().history(),
+                &self.thread,
+                Reading::Below(SCAN_END),
+            )
+            .await?;
         }
         let serving = self.current();
         let fresh = match (&serving, self.logs.path(&self.thread)) {
             (Serving::Legacy(_), ThreadPath::Legacy) => return Ok(serving),
-            (Serving::Resident(bound), ThreadPath::Resident) => {
-                let log = self.binding.log();
-                if Arc::ptr_eq(&bound.log, &log) {
-                    return Ok(serving);
-                }
-                Serving::Resident(self.bind(bound, log).await?)
-            }
+            (Serving::Resident(bound), ThreadPath::Resident) => match self.binding.log() {
+                Some(log) if Arc::ptr_eq(&bound.log, &log) => return Ok(serving),
+                Some(log) => Serving::Resident(self.bind(bound, log).await?),
+                None => Serving::Resident(self.rebound(bound).await?),
+            },
             (Serving::Resident(bound), ThreadPath::Legacy) => {
-                Serving::Legacy(self.old(bound).await?)
+                Serving::Legacy(self.old(Some(bound)).await?)
             }
             (Serving::Legacy(old), ThreadPath::Resident) => {
                 Serving::Resident(self.adopted(old).await?)
@@ -300,7 +346,7 @@ impl OneLogOver {
         Ok(self.settled(&serving, fresh))
     }
 
-    async fn old(&self, resident: &Arc<Bound>) -> Result<Arc<Old>, StoreError> {
+    async fn drained(&self) -> Result<(), StoreError> {
         let mut reached = self.logs.reach(&self.thread).await.map_err(refused)?;
         if reached.state().is_none()
             && let Err(ScopeError::Unreachable { .. }) = reached.send(ThreadCommand::Pending).await
@@ -308,14 +354,18 @@ impl OneLogOver {
             reached = self.logs.reach(&self.thread).await.map_err(refused)?;
         }
         local(&reached)?;
-        match self.logs.scopes().drain(&self.thread).await {
-            Ok(_) | Err(ScopeError::Moved) => {}
-            Err(error) => return Err(refused(error)),
-        }
+        unclaimed(&self.logs, &self.thread).await?;
         drop(reached);
-        let mut policy = self.policy.clone();
-        policy.effects = resident.holds.effects().read(Clone::clone);
-        let log = OneLog::open(self.logs.host(), self.thread.as_str(), policy).await?;
+        Ok(())
+    }
+
+    async fn old(&self, resident: Option<&Arc<Bound>>) -> Result<Arc<Old>, StoreError> {
+        if resident.is_some() {
+            self.drained().await?;
+        } else {
+            held(&self.logs, &self.thread).await?;
+        }
+        let log = writer(&self.logs, &self.thread, &self.policy, &self.effects).await?;
         if self.durable.load(Ordering::Relaxed) {
             log.settle_durably();
         }
@@ -328,18 +378,32 @@ impl OneLogOver {
         let uncertain = log.uncertain_holds().await;
         Ok(Arc::new(Old {
             log,
-            resident: Arc::clone(resident),
+            resident: resident.cloned(),
             uncertain,
         }))
     }
 
     async fn adopted(&self, old: &Old) -> Result<Arc<Bound>, StoreError> {
         handed_over(&old.log).await?;
-        let mut log = self.binding.log();
-        if log.retired() || Arc::ptr_eq(&log, &old.resident.log) {
-            log = self.binding.rebound(&log).await.map_err(refused)?;
-        }
-        self.bind(&old.resident, log).await
+        let stale = old.resident.as_ref().map(|bound| &bound.log);
+        let log = match self.binding.log() {
+            Some(log) if !log.retired() && !stale.is_some_and(|stale| Arc::ptr_eq(&log, stale)) => {
+                log
+            }
+            current => self
+                .binding
+                .rebound(current.as_ref())
+                .await
+                .map_err(refused)?,
+        };
+        let Some(resident) = &old.resident else {
+            let bound = Arc::new(bound(log, &self.thread, &self.policy, &self.effects)?);
+            if let Some(index) = self.index.read(Clone::clone) {
+                bound.wakes.index_wakes(index).await?;
+            }
+            return Ok(bound);
+        };
+        self.bind(resident, log).await
     }
 
     async fn again(&self, stale: &Serving) -> Result<Serving, StoreError> {
@@ -348,13 +412,17 @@ impl OneLogOver {
         }
         let fresh = match stale {
             Serving::Resident(bound) => Serving::Resident(self.rebound(bound).await?),
-            Serving::Legacy(old) => Serving::Legacy(self.old(&old.resident).await?),
+            Serving::Legacy(old) => Serving::Legacy(self.old(old.resident.as_ref()).await?),
         };
         Ok(self.settled(stale, fresh))
     }
 
     async fn rebound(&self, stale: &Bound) -> Result<Arc<Bound>, StoreError> {
-        let log = self.binding.rebound(&stale.log).await.map_err(refused)?;
+        let log = self
+            .binding
+            .rebound(Some(&stale.log))
+            .await
+            .map_err(refused)?;
         self.bind(stale, log).await
     }
 
@@ -606,9 +674,9 @@ impl OneLogOver {
 
     pub fn declare(&self, tool: impl Into<String>, class: EffectClass) {
         let tool = tool.into();
-        let serving = self.current();
-        serving.resident().holds.declare(tool.clone(), class);
-        if let Serving::Legacy(old) = serving {
+        self.effects
+            .update(|effects| effects.insert(tool.clone(), class));
+        if let Serving::Legacy(old) = self.current() {
             old.log.declare(tool, class);
         }
     }

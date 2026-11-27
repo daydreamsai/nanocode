@@ -44,15 +44,17 @@ const RESTARTS: u64 = 2 * ROUNDS.end;
 pub enum FlipsMutation {
     None,
     FlipOffUnreadable,
+    LegacyOpenClaims,
 }
 
 impl FlipsMutation {
-    const ALL: [Self; 2] = [Self::None, Self::FlipOffUnreadable];
+    const ALL: [Self; 3] = [Self::None, Self::FlipOffUnreadable, Self::LegacyOpenClaims];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::FlipOffUnreadable => "flip_off_unreadable",
+            Self::LegacyOpenClaims => "legacy_open_claims",
         }
     }
 
@@ -60,6 +62,7 @@ impl FlipsMutation {
         match self {
             Self::None => Mutation::None,
             Self::FlipOffUnreadable => Mutation::FlipOffUnreadable,
+            Self::LegacyOpenClaims => Mutation::LegacyOpenClaims,
         }
     }
 
@@ -200,7 +203,17 @@ fn opened(world: &World, node: &Node, paths: &Arc<Switched>) -> Option<Arc<OneLo
         restarts: RESTARTS,
         ..Policy::default()
     };
+    let legacy = paths.path(THREAD) == ThreadPath::Legacy;
+    let loads = node.logs.scopes().stats().loads;
     match driven(world, "a flips open", OneLog::over(logs, THREAD, &policy))? {
+        Ok(_) if legacy && node.logs.scopes().stats().loads != loads => {
+            flag(
+                &world.wrong,
+                "flips: a thread on the legacy path loads its scope when the facade opens"
+                    .to_owned(),
+            );
+            None
+        }
         Ok(over) => Some(over),
         Err(error) => {
             flag(&world.wrong, format!("flips: the thread opens: {error}"));

@@ -521,6 +521,7 @@ default_table='
 4 flips pass --scenario flips
 1 flips_twice pass --scenario flips --twice
 1 canary_flips_flip_off_unreadable canary:16 --scenario flips --mutation flip_off_unreadable
+1 canary_flips_legacy_open_claims canary:16 --scenario flips --mutation legacy_open_claims
 8 repo_cache pass --scenario repo_cache
 2 repo_cache_twice pass --scenario repo_cache --twice
 1 canary_repo_cache_shared_head canary:8 --scenario repo_cache --mutation shared_head

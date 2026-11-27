@@ -389,6 +389,17 @@ impl<F: Resident> Scopes<F> {
         }
     }
 
+    pub async fn hold(&self, scope: &str) -> Result<u64, ScopeError> {
+        let part = self.inner.leases.partition(scope);
+        if let Some(epoch) = self.inner.leases.held(part) {
+            return Ok(epoch);
+        }
+        match self.inner.claim(scope, part).await? {
+            Ok(epoch) => Ok(epoch),
+            Err(holder) => Err(ScopeError::Routed { holder }),
+        }
+    }
+
     pub async fn release(&self, part: Partition) -> Result<(), ScopeError> {
         self.inner.release(part).await
     }
@@ -450,6 +461,10 @@ impl<F: Resident> Scopes<F> {
 
     pub fn history(&self) -> Arc<dyn LogHost> {
         Arc::clone(&self.inner.logs.history)
+    }
+
+    pub fn legacy(&self) -> Arc<dyn LogHost> {
+        Arc::clone(&self.inner.logs.legacy)
     }
 
     pub fn read_capacity(&self) -> u32 {

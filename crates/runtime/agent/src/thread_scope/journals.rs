@@ -75,7 +75,7 @@ impl ThreadJournals {
     }
 
     #[must_use]
-    pub fn log(&self) -> Arc<ThreadLog> {
+    pub fn log(&self) -> Option<Arc<ThreadLog>> {
         self.0.bind.log()
     }
 
@@ -284,7 +284,7 @@ impl Inner {
         }
         let first = self.bind.serving(UNRETRIED).await?;
         let (log, (fresh, seq), retries) = match staged_on(&first, &update).await {
-            Err(ScopeError::Lost) => match self.bind.again(&first, UNRETRIED).await {
+            Err(ScopeError::Lost) => match self.bind.again(Some(&first), UNRETRIED).await {
                 Some(log) => {
                     let log = log?;
                     let staged = staged_on(&log, &update).await?;
@@ -306,15 +306,17 @@ impl Inner {
             return Ok(());
         }
         let log = match log.flush(None).await {
-            Err(ScopeError::Lost) if retries => match self.bind.again(&log, UNRETRIED).await {
-                Some(log) => {
-                    let log = log?;
-                    staged_on(&log, &update).await?;
-                    log.flush(None).await?;
-                    log
+            Err(ScopeError::Lost) if retries => {
+                match self.bind.again(Some(&log), UNRETRIED).await {
+                    Some(log) => {
+                        let log = log?;
+                        staged_on(&log, &update).await?;
+                        log.flush(None).await?;
+                        log
+                    }
+                    None => return Err(ScopeError::Lost),
                 }
-                None => return Err(ScopeError::Lost),
-            },
+            }
             flushed => flushed.map(|_| log)?,
         };
         self.bind.settled(&log, UNRETRIED).await

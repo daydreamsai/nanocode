@@ -786,7 +786,6 @@ impl Resident for ThreadFold {
 #[derive(Clone)]
 pub struct ThreadLogs {
     scopes: Scopes<ThreadFold>,
-    host: Arc<dyn LogHost>,
     history: Arc<dyn LogHost>,
     policy: ThreadPolicy,
     fold: Arc<ThreadFold>,
@@ -800,13 +799,11 @@ impl ThreadLogs {
             wiring.fold.policy.recent_rows >= wiring.policy.checkpoint_rows,
             "a thread keeps at least the rows its owner may hold uncommitted"
         );
-        let host = Arc::clone(&wiring.log);
         let fold = Arc::clone(&wiring.fold);
         let policy = wiring.fold.policy;
         let scopes = Scopes::new(wiring);
         Self {
             history: scopes.history(),
-            host,
             policy,
             fold,
             paths: None,
@@ -838,10 +835,6 @@ impl ThreadLogs {
             before < u64::MAX,
             "a thread's flips are counted without wrapping"
         );
-    }
-
-    pub(crate) fn host(&self) -> Arc<dyn LogHost> {
-        Arc::clone(&self.host)
     }
 
     #[must_use]

@@ -8,11 +8,11 @@ use super::{ThreadLog, ThreadLogs, sim};
 pub(crate) struct ThreadBinding {
     logs: Arc<ThreadLogs>,
     thread: Arc<str>,
-    log: Atom<Arc<ThreadLog>>,
+    log: Atom<Option<Arc<ThreadLog>>>,
 }
 
 impl ThreadBinding {
-    pub(crate) fn new(logs: Arc<ThreadLogs>, thread: &str, log: Arc<ThreadLog>) -> Self {
+    pub(crate) fn new(logs: Arc<ThreadLogs>, thread: &str, log: Option<Arc<ThreadLog>>) -> Self {
         Self {
             logs,
             thread: Arc::from(thread),
@@ -20,25 +20,31 @@ impl ThreadBinding {
         }
     }
 
-    pub(crate) fn log(&self) -> Arc<ThreadLog> {
-        self.log.read(Arc::clone)
+    pub(crate) fn log(&self) -> Option<Arc<ThreadLog>> {
+        self.log.read(Clone::clone)
     }
 
     pub(crate) async fn rebound(
         &self,
-        stale: &Arc<ThreadLog>,
+        stale: Option<&Arc<ThreadLog>>,
     ) -> Result<Arc<ThreadLog>, ScopeError> {
-        let current = self.log();
-        if !Arc::ptr_eq(&current, stale) {
+        if let Some(current) = self.log()
+            && !stale.is_some_and(|stale| Arc::ptr_eq(&current, stale))
+        {
             return Ok(current);
         }
         let fresh = Arc::new(self.logs.get(&self.thread).await?);
-        Ok(self.log.update(|log| {
-            if Arc::ptr_eq(log, stale) {
-                *log = Arc::clone(&fresh);
+        let bound = self.log.update(|log| {
+            let replaced = log
+                .as_ref()
+                .is_none_or(|log| stale.is_some_and(|stale| Arc::ptr_eq(log, stale)));
+            if replaced {
+                *log = Some(Arc::clone(&fresh));
             }
-            Arc::clone(log)
-        }))
+            log.clone()
+        });
+        assert!(bound.is_some(), "a rebound binding holds a thread log");
+        Ok(bound.unwrap_or(fresh))
     }
 }
 
@@ -49,16 +55,16 @@ pub(super) enum Bind {
 }
 
 impl Bind {
-    pub(super) fn log(&self) -> Arc<ThreadLog> {
+    pub(super) fn log(&self) -> Option<Arc<ThreadLog>> {
         match self {
-            Self::Fixed(log) => Arc::clone(log),
+            Self::Fixed(log) => Some(Arc::clone(log)),
             Self::Rebinds(binding) => binding.log(),
         }
     }
 
     pub(super) async fn again(
         &self,
-        stale: &Arc<ThreadLog>,
+        stale: Option<&Arc<ThreadLog>>,
         unretried: sim::Mutation,
     ) -> Option<Result<Arc<ThreadLog>, ScopeError>> {
         match self {
@@ -74,12 +80,14 @@ impl Bind {
         unretried: sim::Mutation,
     ) -> Result<Arc<ThreadLog>, ScopeError> {
         let log = self.log();
-        if !log.retired() {
-            return Ok(log);
+        if let Some(log) = &log
+            && !log.retired()
+        {
+            return Ok(Arc::clone(log));
         }
-        match self.again(&log, unretried).await {
+        match self.again(log.as_ref(), unretried).await {
             Some(fresh) => fresh,
-            None => Ok(log),
+            None => log.ok_or(ScopeError::Lost),
         }
     }
 
@@ -91,7 +99,7 @@ impl Bind {
         if !log.retired() {
             return Ok(());
         }
-        match self.again(log, unretried).await {
+        match self.again(Some(log), unretried).await {
             Some(fresh) => fresh?.flush(None).await.map(drop),
             None => Ok(()),
         }
@@ -108,7 +116,7 @@ impl Bind {
     {
         let log = self.serving(unretried).await?;
         match command(Arc::clone(&log)).await {
-            Err(ScopeError::Lost) => match self.again(&log, unretried).await {
+            Err(ScopeError::Lost) => match self.again(Some(&log), unretried).await {
                 Some(fresh) => command(fresh?).await,
                 None => Err(ScopeError::Lost),
             },

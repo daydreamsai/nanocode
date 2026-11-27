@@ -32,6 +32,7 @@ pub struct Usage {
     pub checkpoint: Work,
     pub adopt: Work,
     pub history: Work,
+    pub legacy: Work,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub(crate) enum Class {
     Checkpoint,
     Adopt,
     History,
+    Legacy,
 }
 
 #[derive(Default)]
@@ -77,6 +79,7 @@ pub(crate) struct Tally {
     checkpoint: Counters,
     adopt: Counters,
     history: Counters,
+    legacy: Counters,
 }
 
 impl Tally {
@@ -87,6 +90,7 @@ impl Tally {
             Class::Checkpoint => &self.checkpoint,
             Class::Adopt => &self.adopt,
             Class::History => &self.history,
+            Class::Legacy => &self.legacy,
         }
     }
 
@@ -101,6 +105,7 @@ impl Tally {
             checkpoint: self.checkpoint.work(),
             adopt: self.adopt.work(),
             history: self.history.work(),
+            legacy: self.legacy.work(),
         }
     }
 }
@@ -118,6 +123,7 @@ pub(crate) struct Logs {
     pub(crate) append: Arc<dyn LogHost>,
     pub(crate) adopt: Arc<dyn LogHost>,
     pub(crate) history: Arc<dyn LogHost>,
+    pub(crate) legacy: Arc<dyn LogHost>,
 }
 
 struct View {
@@ -173,6 +179,7 @@ impl Meter {
             append: view(Class::Append),
             adopt: view(Class::Adopt),
             history: view(Class::History),
+            legacy: view(Class::Legacy),
         };
         (meter, logs)
     }
@@ -301,7 +308,7 @@ impl Meter {
         call: impl Future<Output = Result<T, StoreError>>,
     ) -> Result<T, StoreError> {
         match class {
-            Class::History => self.admission.admitted(call).await,
+            Class::History | Class::Legacy => self.admission.admitted(call).await,
             Class::Load | Class::Append | Class::Checkpoint | Class::Adopt => call.await,
         }
     }

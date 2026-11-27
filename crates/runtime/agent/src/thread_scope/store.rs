@@ -137,7 +137,7 @@ impl ThreadStore {
     }
 
     #[must_use]
-    pub fn log(&self) -> Arc<ThreadLog> {
+    pub fn log(&self) -> Option<Arc<ThreadLog>> {
         self.0.bind.log()
     }
 
@@ -261,7 +261,8 @@ impl Inner {
 
 impl StateStore for ThreadStore {
     fn facts(&self) -> Option<Arc<dyn FactLogs>> {
-        Some(Arc::new(ThreadFacts::new(self.log())))
+        self.log()
+            .map(|log| Arc::new(ThreadFacts::new(log)) as Arc<dyn FactLogs>)
     }
 
     fn read_record<'a>(
@@ -417,12 +418,14 @@ impl StateStore for ThreadStore {
 
     fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
-            let log = self.log();
+            let Some(log) = self.log() else {
+                return Ok(());
+            };
             let unretried = sim::Mutation::StoreLostUnretried;
             match log.flush(None).await {
                 Ok(_) => self.0.bind.settled(&log, unretried).await.map_err(refused),
                 Err(ScopeError::Lost) => {
-                    if let Some(fresh) = self.0.bind.again(&log, unretried).await {
+                    if let Some(fresh) = self.0.bind.again(Some(&log), unretried).await {
                         fresh.map_err(refused)?;
                     }
                     Err(StoreError::Fenced)

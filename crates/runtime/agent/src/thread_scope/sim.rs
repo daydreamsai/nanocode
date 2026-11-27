@@ -32,6 +32,7 @@ pub enum Mutation {
     TailUnbounded,
     OpenPerRequest,
     ResidentDropsBlob,
+    LegacyOpenClaims,
 }
 
 impl Mutation {
@@ -97,6 +98,7 @@ impl Mutation {
             Self::TailUnbounded => "tail_unbounded",
             Self::OpenPerRequest => "open_per_request",
             Self::ResidentDropsBlob => "resident_drops_blob",
+            Self::LegacyOpenClaims => "legacy_open_claims",
         }
     }
 
