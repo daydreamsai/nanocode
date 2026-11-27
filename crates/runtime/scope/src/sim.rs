@@ -24,10 +24,11 @@ pub enum Mutation {
     RoutesPastExpiry,
     LegacyAdmittedIdle,
     ChainInStoreOrder,
+    ReleaseStopsAtDrain,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::CheckpointIndexesOnly,
         Self::ReadThroughWriter,
         Self::PublishBeforeCommit,
@@ -44,6 +45,7 @@ impl Mutation {
         Self::MeterSkipsWriterTask,
         Self::RoutesPastExpiry,
         Self::ChainInStoreOrder,
+        Self::ReleaseStopsAtDrain,
     ];
 
     pub const ADMISSION: [Self; 4] = [
@@ -77,6 +79,7 @@ impl Mutation {
             Self::RoutesPastExpiry => "routes_past_expiry",
             Self::LegacyAdmittedIdle => "legacy_admitted_idle",
             Self::ChainInStoreOrder => "chain_in_store_order",
+            Self::ReleaseStopsAtDrain => "release_stops_at_drain",
         }
     }
 

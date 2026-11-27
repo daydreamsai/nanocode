@@ -58,6 +58,7 @@ pub struct Stats {
     pub usage: Usage,
     pub admissions: u64,
     pub admissions_busy: u64,
+    pub release_drops: u64,
 }
 
 pub struct Wiring<F: Resident> {
@@ -830,11 +831,48 @@ impl<F: Resident> Inner<F> {
                 .cloned()
                 .collect()
         });
+        let stops = sim::mutated(Mutation::ReleaseStopsAtDrain);
+        let mut dropped = 0;
         for owner in &owners {
-            self.drain(owner, Why::Release).await?;
+            let drained = if stops {
+                self.drain(owner, Why::Release).await.map(drop)
+            } else {
+                self.released(owner, part).await
+            };
+            match drained {
+                Ok(()) => {}
+                Err(error) if stops => return Err(error),
+                Err(_) => dropped += 1,
+            }
         }
         self.leases.release(part).await?;
-        self.stats.update(|stats| stats.releases += 1);
+        self.stats.update(|stats| {
+            stats.releases += 1;
+            stats.release_drops += dropped;
+        });
+        Ok(())
+    }
+
+    async fn released(&self, owner: &Arc<Owner<F>>, part: Partition) -> Result<(), ScopeError> {
+        let owner = match owner.life() {
+            Life::Serving | Life::Draining => Arc::clone(owner),
+            Life::Released { .. } => {
+                self.evicted(owner);
+                return Ok(());
+            }
+            Life::Lost => {
+                self.evicted(owner);
+                if self.leases.held(part) != Some(owner.epoch) {
+                    return Ok(());
+                }
+                self.load(&owner.scope, part, owner.epoch).await?
+            }
+        };
+        if let Err(error) = self.drain(&owner, Why::Release).await {
+            owner.lose();
+            self.evicted(&owner);
+            return Err(error);
+        }
         Ok(())
     }
 

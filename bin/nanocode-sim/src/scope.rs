@@ -69,6 +69,8 @@ const BURST_PPM: u64 = 60_000;
 const BURST_SENDS: Range<u64> = 3..7;
 const STAGE_PPM: u64 = 80_000;
 const STAGES: Range<u64> = 1..4;
+const REPLACE_PPM: u64 = 10_000;
+const STALLS_BEFORE_REPLACE: u64 = 3;
 const RIDER_HOST: usize = 7;
 const RIDER_SQL: &str = "UPDATE rider SET seen = $1";
 
@@ -132,6 +134,8 @@ pub struct ScopeStats {
     pub staged: u64,
     pub flushes: u64,
     pub carried: u64,
+    pub replacements: u64,
+    pub release_drops: u64,
 }
 
 impl ScopeStats {
@@ -171,6 +175,8 @@ impl ScopeStats {
         self.staged += other.staged;
         self.flushes += other.flushes;
         self.carried += other.carried;
+        self.replacements += other.replacements;
+        self.release_drops += other.release_drops;
     }
 
     fn runtime(&mut self, stats: &Stats) {
@@ -976,8 +982,11 @@ fn epoch_of(world: &World, scope: &str) -> Option<u64> {
     }
 }
 
-async fn all<T>(mut sends: Vec<Pin<Box<dyn Future<Output = T> + '_>>>) -> Vec<T> {
-    let mut answers: Vec<Option<T>> = sends.iter().map(|_| None).collect();
+async fn all<T>(
+    mut sends: Vec<Pin<Box<dyn Future<Output = T> + '_>>>,
+    mut answers: Vec<Option<T>>,
+) -> Vec<T> {
+    assert_eq!(sends.len(), answers.len(), "every send has its answer slot");
     std::future::poll_fn(|context| {
         for (send, answer) in sends.iter_mut().zip(answers.iter_mut()) {
             if answer.is_none()
@@ -1032,12 +1041,16 @@ fn burst(rng: &mut Rng, world: &World, nodes: &mut [Node], stats: &mut ScopeStat
             .into_iter()
             .map(|command| Box::pin(handle.send(command)) as Pin<Box<dyn Future<Output = _>>>)
             .collect();
-    for send in &mut sends {
-        let _ = send.as_mut().poll(&mut Context::from_waker(Waker::noop()));
-    }
+    let early: Vec<Option<Result<Committed<u64>, ScopeError>>> = sends
+        .iter_mut()
+        .map(|send| match send.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(answer) => Some(answer),
+            Poll::Pending => None,
+        })
+        .collect();
     signal.fire();
     node.tap.gate.set(None);
-    let answers = driven(world, "a burst", all(sends)).unwrap_or_default();
+    let answers = driven(world, "a burst", all(sends, early)).unwrap_or_default();
     if before.is_none() || epoch_of(world, &scope) != before {
         return;
     }
@@ -1161,6 +1174,44 @@ fn flushed(
                 "rider: the rider of a flush of {scope} at row {next} did not land in the write of its rows"
             ),
         );
+    }
+}
+
+fn replace(
+    rng: &mut Rng,
+    world: &World,
+    nodes: &mut [Node],
+    generation: &mut u64,
+    stats: &mut ScopeStats,
+) {
+    stats.replacements += 1;
+    for _ in 0..STALLS_BEFORE_REPLACE {
+        stall(rng, world, nodes, stats);
+    }
+    for at in 0..nodes.len() {
+        if !nodes[at].paused {
+            let held: Vec<Partition> = (0..PARTS)
+                .map(Partition)
+                .filter(|part| nodes[at].log.held(*part).is_some())
+                .collect();
+            for part in held {
+                let released = driven(world, "a shutdown release", nodes[at].scopes.release(part));
+                if let Some(Row::Held { holder, .. }) = world.store.fence_row(part)
+                    && holder == nodes[at].name
+                {
+                    flag(
+                        &world.wrong,
+                        format!(
+                            "deploy: {} shut down still holding partition {}, so every get of its scopes routes to it until its lease lapses: {released:?}",
+                            nodes[at].name, part.0
+                        ),
+                    );
+                }
+            }
+            stats.release_drops += nodes[at].scopes.stats().release_drops;
+        }
+        *generation += 1;
+        nodes[at] = world.node(&format!("n{at}g{generation}"));
     }
 }
 
@@ -1294,6 +1345,7 @@ fn roll(
         STALE_PPM,
         BURST_PPM,
         STAGE_PPM,
+        REPLACE_PPM,
     ]
     .into_iter();
     let mut floor = 0;
@@ -1351,6 +1403,10 @@ fn roll(
     } else if band() {
         publish(world, nodes);
         staging(rng, world, nodes, stats);
+    } else if band() {
+        publish(world, nodes);
+        replace(rng, world, nodes, generation, stats);
+        crashed = Some(nodes.len());
     } else {
         publish(world, nodes);
         send(rng, world, nodes, stats);
