@@ -16,7 +16,7 @@ use crate::{
     Adopted, Carry, Committed, Flushed, Part, Policy, Resident, ScopeError,
     checkpoint::{Checkpoints, Listing, Manifest, digest},
     lease::Leases,
-    meter::{Logs, Meter, Usage},
+    meter::{Logs, Meter, Tally, Usage},
     owner::{Ask, Chain, Checkpointed, Core, Life, Owner, Placed, Turn, Why},
     route::Route,
     sim::{self, Mutation},
@@ -76,6 +76,11 @@ pub struct Backfilled {
 struct Due {
     part: Partition,
     epoch: u64,
+}
+
+struct Quiet {
+    tally: Arc<Tally>,
+    seen: u64,
 }
 
 enum Backfill {
@@ -191,6 +196,7 @@ pub(crate) struct Inner<F: Resident> {
     loads: Flights<Arc<Owner<F>>>,
     claims: Flights<u64>,
     backfills: Atom<OrdMap<Arc<str>, Due>>,
+    quiet: Atom<OrdMap<Arc<str>, Arc<Quiet>>>,
     running: Atom<OrdSet<Arc<str>>>,
     unreachable: Atom<BTreeSet<String>>,
     tick: AtomicU64,
@@ -390,6 +396,7 @@ impl<F: Resident> Scopes<F> {
                 loads: Flights::new(),
                 claims: Flights::new(),
                 backfills: Atom::default(),
+                quiet: Atom::default(),
                 running: Atom::default(),
                 unreachable: Atom::default(),
                 tick: AtomicU64::new(0),
@@ -575,6 +582,51 @@ impl<F: Resident> Inner<F> {
                 backfills.remove(scope);
             }
         });
+        let unwatched: Vec<Arc<str>> = self.quiet.read(|quiet| {
+            quiet
+                .keys()
+                .filter(|scope| {
+                    !self
+                        .backfills
+                        .read(|backfills| backfills.contains_key(*scope))
+                })
+                .cloned()
+                .collect()
+        });
+        for scope in &unwatched {
+            self.unwatch(scope);
+        }
+    }
+
+    fn watch(&self, scope: &str) {
+        let name: Arc<str> = Arc::from(scope);
+        let tally = self.meter.enter(&name);
+        let quiet = Arc::new(Quiet { tally, seen: 0 });
+        self.quiet
+            .update(|watched| watched.insert(Arc::clone(&name), Arc::clone(&quiet)));
+    }
+
+    fn unwatch(&self, scope: &str) {
+        if let Some(quiet) = self.quiet.update(|quiet| quiet.remove(scope)) {
+            self.meter.leave(scope, &quiet.tally);
+        }
+    }
+
+    fn quiet(&self, scope: &Arc<str>) -> bool {
+        let Some(quiet) = self.quiet.read(|quiet| quiet.get(scope).cloned()) else {
+            return true;
+        };
+        let now = quiet.tally.usage().legacy.calls;
+        if now == quiet.seen {
+            return true;
+        }
+        let seen = Arc::new(Quiet {
+            tally: Arc::clone(&quiet.tally),
+            seen: now,
+        });
+        self.quiet
+            .update(|watched| watched.insert(Arc::clone(scope), Arc::clone(&seen)));
+        false
     }
 
     async fn get(self: &Arc<Self>, scope: &str) -> Result<Reached<F>, ScopeError> {
@@ -731,18 +783,27 @@ impl<F: Resident> Inner<F> {
     }
 
     fn queue(&self, scope: &str, due: Due) -> ScopeError {
-        self.backfills
+        let before = self
+            .backfills
             .update(|backfills| backfills.insert(Arc::from(scope), due));
+        if before.is_none() {
+            self.watch(scope);
+        }
         self.stats.update(|stats| stats.unadopted += 1);
         ScopeError::Unadopted
     }
 
     fn undue(&self, scope: &str, due: Due) {
-        self.backfills.update(|backfills| {
+        let removed = self.backfills.update(|backfills| {
             if backfills.get(scope) == Some(&due) {
                 backfills.remove(scope);
+                return true;
             }
+            false
         });
+        if removed {
+            self.unwatch(scope);
+        }
     }
 
     async fn unadopted(
@@ -792,7 +853,12 @@ impl<F: Resident> Inner<F> {
                 Ok(Backfill::Adopted) => backfilled.adopted += 1,
                 Ok(Backfill::Current) => backfilled.current += 1,
                 Ok(Backfill::Dropped) => backfilled.dropped += 1,
-                Err(error) => backfilled.failed.push((scope.as_ref().to_owned(), error)),
+                Err(error) => {
+                    if self.due(&scope, due.epoch) {
+                        self.watch(&scope);
+                    }
+                    backfilled.failed.push((scope.as_ref().to_owned(), error));
+                }
             }
             tried.insert(scope);
         }
@@ -805,13 +871,18 @@ impl<F: Resident> Inner<F> {
     fn claim_due(&self, tried: &BTreeSet<Arc<str>>) -> Option<(Arc<str>, Due)> {
         let capacity = usize::try_from(self.meter.admission().capacity())
             .expect("a read capacity fits in usize");
-        let due: Vec<(Arc<str>, Due)> = self.backfills.read(|backfills| {
-            backfills
-                .iter()
-                .filter(|(scope, _)| !tried.contains(*scope))
-                .map(|(scope, due)| (Arc::clone(scope), *due))
-                .collect()
-        });
+        let due: Vec<(Arc<str>, Due)> = self
+            .backfills
+            .read(|backfills| {
+                backfills
+                    .iter()
+                    .filter(|(scope, _)| !tried.contains(*scope))
+                    .map(|(scope, due)| (Arc::clone(scope), *due))
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .filter(|(scope, _)| self.quiet(scope))
+            .collect();
         let claimed = self.running.update(|running| {
             if running.len() >= capacity {
                 return None;
