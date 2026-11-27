@@ -13,7 +13,7 @@ pub fn probe(scope: &str, stored: &[(u64, String)], seq: u64, limit: Option<usiz
     let disk = Disk::new();
     disk.with(|rows| rows.insert(scope, stored));
     let host: Arc<dyn LogHost> = Arc::new(SimHost::new(Arc::clone(&disk)));
-    let log = refused(scope, ready(TurnLog::open(host, scope)))
+    let log = refused(scope, ready(nanocode_turnlog::sim::open(host, scope)))
         .row_limit(limit)
         .snapshot_ratio(ratio);
     refused(scope, ready(log.load_index()));

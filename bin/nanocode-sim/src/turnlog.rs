@@ -712,7 +712,10 @@ impl TurnLogPolicy {
         };
         let whole = self.whole();
         if !self.followers.contains_key(scope) {
-            let follower = refused(ready(TurnLog::follow(Arc::clone(&self.host), scope)));
+            let follower = refused(ready(nanocode_turnlog::sim::follow(
+                Arc::clone(&self.host),
+                scope,
+            )));
             self.followers.insert(scope.to_owned(), follower);
         }
         let follower = self
@@ -747,9 +750,12 @@ impl TurnLogPolicy {
             .remove(scope)
             .expect("a follower was read above");
         let claimed = if opens {
-            refused(ready(TurnLog::open(Arc::clone(&self.host), scope)))
+            refused(ready(nanocode_turnlog::sim::open(
+                Arc::clone(&self.host),
+                scope,
+            )))
         } else {
-            refused(ready(follower.claim()))
+            refused(ready(nanocode_turnlog::sim::claim(follower)))
         }
         .retain_finished(self.retain)
         .row_limit(self.limit)
@@ -784,7 +790,10 @@ impl TurnLogPolicy {
             matches!(served, Err(StoreError::Fenced)),
             "{scope} serves a read from its fenced writer after a takeover at commit {seq}: {served:?}"
         );
-        let cold = refused(ready(TurnLog::open(Arc::clone(&self.host), scope)));
+        let cold = refused(ready(nanocode_turnlog::sim::open(
+            Arc::clone(&self.host),
+            scope,
+        )));
         let stale_key = format!("{scope}:stale");
         let read = move |fold: &Fold| {
             (
@@ -826,17 +835,20 @@ impl TurnLogPolicy {
     fn log(&mut self, scope: &str) -> &TurnLog {
         if !self.logs.contains_key(scope) {
             let whole = self.whole();
-            let log = refused(ready(TurnLog::open(Arc::clone(&self.host), scope)))
-                .retain_finished(self.retain)
-                .row_limit(self.limit)
-                .chain_bytes_max(self.chain_bytes)
-                .snapshot_ratio(if self.ratio_ignored {
-                    u32::MAX as usize
-                } else {
-                    self.ratio
-                })
-                .snapshot_rows(self.rows)
-                .whole_checkpoints(whole);
+            let log = refused(ready(nanocode_turnlog::sim::open(
+                Arc::clone(&self.host),
+                scope,
+            )))
+            .retain_finished(self.retain)
+            .row_limit(self.limit)
+            .chain_bytes_max(self.chain_bytes)
+            .snapshot_ratio(if self.ratio_ignored {
+                u32::MAX as usize
+            } else {
+                self.ratio
+            })
+            .snapshot_rows(self.rows)
+            .whole_checkpoints(whole);
             self.logs.insert(scope.to_owned(), log);
         }
         &self.logs[scope]
@@ -999,17 +1011,20 @@ impl TurnDurability for TurnLogPolicy {
 
     fn load(&mut self, _log: &mut dyn Log, scope: &str) -> ScopeState {
         let whole = self.whole();
-        let log = refused(ready(TurnLog::open(Arc::clone(&self.host), scope)))
-            .retain_finished(self.retain)
-            .row_limit(self.limit)
-            .chain_bytes_max(self.chain_bytes)
-            .snapshot_ratio(if self.ratio_ignored {
-                u32::MAX as usize
-            } else {
-                self.ratio
-            })
-            .snapshot_rows(self.rows)
-            .whole_checkpoints(whole);
+        let log = refused(ready(nanocode_turnlog::sim::open(
+            Arc::clone(&self.host),
+            scope,
+        )))
+        .retain_finished(self.retain)
+        .row_limit(self.limit)
+        .chain_bytes_max(self.chain_bytes)
+        .snapshot_ratio(if self.ratio_ignored {
+            u32::MAX as usize
+        } else {
+            self.ratio
+        })
+        .snapshot_rows(self.rows)
+        .whole_checkpoints(whole);
         let owned = scope.to_owned();
         let (state, revision) = refused(ready(log.read_owner(scope, move |fold| {
             fold.checkpoint(&owned).map_or_else(
@@ -1294,7 +1309,10 @@ impl TurnDurability for TurnLogPolicy {
         );
         if let Some(live) = live {
             let reads = self.disk.with(|rows| rows.reads);
-            let reopened = refused(ready(TurnLog::open(Arc::clone(&self.host), scope)));
+            let reopened = refused(ready(nanocode_turnlog::sim::open(
+                Arc::clone(&self.host),
+                scope,
+            )));
             self.disk.with(|rows| rows.reads = reads);
             let ids = live.1.clone();
             let loaded = ready(reopened.read(move |fold| {
@@ -1334,7 +1352,7 @@ impl TurnDurability for TurnLogPolicy {
             let scratch = Disk::new();
             scratch.with(|rows| rows.insert(scope, &stored));
             let host: Arc<dyn LogHost> = Arc::new(SimHost::new(Arc::clone(&scratch)));
-            let forced = refused(ready(TurnLog::open(host, scope)))
+            let forced = refused(ready(nanocode_turnlog::sim::open(host, scope)))
                 .retain_finished(self.retain)
                 .row_limit(self.limit)
                 .chain_bytes_max(self.chain_bytes)

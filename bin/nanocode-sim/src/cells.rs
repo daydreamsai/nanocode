@@ -518,7 +518,9 @@ impl Cells {
                 ..Policy::default()
             };
             let host: Arc<dyn LogHost> = Arc::clone(&self.host) as Arc<dyn LogHost>;
-            let log = refused(ready(OneLog::open(host, SCOPE, policy)));
+            let log = refused(ready(nanocode::turnlog::thread_scope_sim::open(
+                host, SCOPE, policy,
+            )));
             drop(refused(ready(log.journals())));
             let mut store = log.store();
             let owner = refused(ready(store.acquire(STATE, OwnerId::new()))).owner;

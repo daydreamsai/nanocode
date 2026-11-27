@@ -328,7 +328,7 @@ pub fn blob<'a>(
 
 fn open(host: &Arc<MemoryLog>, shape: Shape) -> Result<TurnLog, String> {
     let host: Arc<dyn LogHost> = host.clone();
-    ready(TurnLog::open(host, SCOPE))
+    ready(nanocode_turnlog::sim::open(host, SCOPE))
         .map(|log| {
             log.snapshot_rows(Some(shape.snapshot_rows))
                 .retain_finished(Some(shape.retain))

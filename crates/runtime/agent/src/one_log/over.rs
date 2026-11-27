@@ -21,7 +21,7 @@ use nanocode_turnlog::{
 };
 use serde_json::{Map, Value, value::RawValue};
 
-use super::{Exported, Fire, Heard, Imported, OneLog, Policy, WakeError};
+use super::{Exported, Fire, Heard, Imported, OneLog, Policy, WakeError, legacy};
 use crate::{
     durability::{StateStore, StoreError, StoreRecord},
     session_log::{LogEntry, LoggedEvent, Started, Submission, Submitted, TurnRecord, TurnState},
@@ -200,17 +200,6 @@ async fn held(logs: &ThreadLogs, thread: &str) -> Result<(), StoreError> {
     unclaimed(logs, thread).await
 }
 
-async fn writer(
-    logs: &ThreadLogs,
-    thread: &str,
-    policy: &Policy,
-    effects: &Atom<Effects>,
-) -> Result<Arc<OneLog>, StoreError> {
-    let mut policy = policy.clone();
-    policy.effects = effects.read(Clone::clone);
-    OneLog::open(logs.scopes().legacy(), thread, policy).await
-}
-
 impl OneLog {
     pub async fn over(
         logs: Arc<ThreadLogs>,
@@ -223,7 +212,7 @@ impl OneLog {
                 drop(logs.reach(thread).await.map_err(refused)?);
             }
             held(&logs, thread).await?;
-            let log = writer(&logs, thread, policy, &effects).await?;
+            let log = legacy::writer(&logs, thread, policy, &effects).await?;
             let uncertain = log.uncertain_holds().await;
             let old = Old {
                 log,
@@ -365,7 +354,7 @@ impl OneLogOver {
         } else {
             held(&self.logs, &self.thread).await?;
         }
-        let log = writer(&self.logs, &self.thread, &self.policy, &self.effects).await?;
+        let log = legacy::writer(&self.logs, &self.thread, &self.policy, &self.effects).await?;
         if self.durable.load(Ordering::Relaxed) {
             log.settle_durably();
         }

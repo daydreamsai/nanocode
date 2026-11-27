@@ -1,9 +1,9 @@
 use std::{ops::Range, sync::Arc};
 
-use nanocode::turnlog::{OneLog, Policy as LogPolicy, ThreadState, thread_history};
+use nanocode::turnlog::{Policy as LogPolicy, ThreadState, thread_history};
 use nanocode_partitions::Partition;
 use nanocode_scope::ScopeError;
-use nanocode_turnlog::{LogHost, TurnLog};
+use nanocode_turnlog::LogHost;
 
 use crate::rng::Rng;
 use crate::threadlegacy::{self, Legacy};
@@ -296,7 +296,7 @@ fn opened(world: &World, host: &Arc<dyn LogHost>, ids: &[String], when: &str) ->
     let open = driven(
         world,
         "a compat open",
-        OneLog::open(Arc::clone(host), THREAD, LogPolicy::default()),
+        nanocode::turnlog::thread_scope_sim::open(Arc::clone(host), THREAD, LogPolicy::default()),
     )?;
     let log = match open {
         Ok(log) => log,
@@ -322,7 +322,7 @@ fn opened(world: &World, host: &Arc<dyn LogHost>, ids: &[String], when: &str) ->
     let follower = match driven(
         world,
         "a compat follow",
-        TurnLog::follow(Arc::clone(host), THREAD),
+        nanocode_turnlog::sim::follow(Arc::clone(host), THREAD),
     )? {
         Ok(follower) => follower,
         Err(error) => {
@@ -336,7 +336,7 @@ fn opened(world: &World, host: &Arc<dyn LogHost>, ids: &[String], when: &str) ->
     let claimed = match driven(
         world,
         "a compat claim",
-        OneLog::claim(follower, LogPolicy::default()),
+        nanocode::turnlog::thread_scope_sim::claim(follower, LogPolicy::default()),
     )? {
         Ok(claimed) => claimed,
         Err(error) => {

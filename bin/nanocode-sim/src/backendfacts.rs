@@ -129,7 +129,8 @@ fn failed(what: &str) -> impl Fn(FoldError) -> String + '_ {
 
 fn open(host: &Arc<MemoryLog>) -> Result<TurnLog, String> {
     let host: Arc<dyn LogHost> = host.clone();
-    ready(TurnLog::open(host, SCOPE)).map_err(|error| format!("open the log: {error}"))
+    ready(nanocode_turnlog::sim::open(host, SCOPE))
+        .map_err(|error| format!("open the log: {error}"))
 }
 
 trait Family: DurableFold<Decision: Send> + Clone + Send + 'static {

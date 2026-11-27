@@ -9,7 +9,7 @@ use std::{
 
 use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_sync::FutureExt;
-use nanocode_turnlog::{LogHost, ScopeRows, TurnLog};
+use nanocode_turnlog::{LogHost, ScopeRows};
 
 use crate::{disk::Disk, turnlog::SimHost};
 
@@ -74,7 +74,7 @@ pub fn probe(scope: &str, stored: &[(u64, String)], seq: u64) {
         host: SimHost::new(disk),
     });
     let host: Arc<dyn LogHost> = Arc::clone(&counted) as Arc<dyn LogHost>;
-    let log = refused(scope, ready(TurnLog::open(host, scope)));
+    let log = refused(scope, ready(nanocode_turnlog::sim::open(host, scope)));
     refused(scope, ready(log.load_all()));
     let stats = ready(log.stats());
     let loads = stats.index_loads + stats.section_loads;

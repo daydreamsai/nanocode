@@ -330,8 +330,12 @@ impl World {
 
     fn open(&mut self) -> Result<(), String> {
         let host: Arc<dyn LogHost> = Arc::clone(&self.host) as Arc<dyn LogHost>;
-        let log = block_on(OneLog::open(host, SCOPE, self.policy.clone()))
-            .map_err(|error| format!("the facts log opens: {error}"))?;
+        let log = block_on(nanocode::turnlog::thread_scope_sim::open(
+            host,
+            SCOPE,
+            self.policy.clone(),
+        ))
+        .map_err(|error| format!("the facts log opens: {error}"))?;
         let logs = StateStore::facts(&log.store())
             .ok_or_else(|| "a OneLog store offers no fact log".to_owned())?;
         let facts = logs.scoped(SCOPE, true);

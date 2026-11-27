@@ -1443,7 +1443,7 @@ impl Follower {
         Ok(taken)
     }
 
-    pub async fn claim(mut self) -> Result<TurnLog, StoreError> {
+    pub(crate) async fn claim(mut self) -> Result<TurnLog, StoreError> {
         self.advance().await?;
         let log = self.finish().await?;
         log.write(|writing| Box::pin(writing.claimed())).await?;
@@ -1750,14 +1750,14 @@ pub struct Writing {
 }
 
 impl TurnLog {
-    pub async fn open(
+    pub(crate) async fn open(
         host: Arc<dyn LogHost>,
         scope: impl Into<Arc<str>>,
     ) -> Result<Self, StoreError> {
         Self::follow(host, scope).await?.finish().await
     }
 
-    pub async fn follow(
+    pub(crate) async fn follow(
         host: Arc<dyn LogHost>,
         scope: impl Into<Arc<str>>,
     ) -> Result<Follower, StoreError> {

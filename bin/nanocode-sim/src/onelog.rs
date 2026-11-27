@@ -871,3 +871,19 @@ impl TurnDurability for OneLog {
         std::mem::take(&mut self.unsealed).into_iter().collect()
     }
 }
+
+pub(crate) async fn parts(
+    host: std::sync::Arc<dyn nanocode::turnlog::LogHost>,
+    scope: &str,
+    policy: nanocode::turnlog::Policy,
+) -> nanocode::durability::Result<nanocode::turnlog::Parts> {
+    let log = nanocode::turnlog::thread_scope_sim::open(host, scope, policy).await?;
+    let store = nanocode::session_store(log.store())?.with_logged_prompts();
+    let journals = log.journals().await?;
+    Ok(nanocode::turnlog::Parts {
+        gate: log.gate(),
+        journals,
+        log,
+        store,
+    })
+}

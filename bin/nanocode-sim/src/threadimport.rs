@@ -37,7 +37,11 @@ fn records(rng: &mut Rng) -> Vec<StoreRecord> {
 
 fn open(world: &World) -> Option<(Arc<OneLog>, ThreadStore)> {
     let host: Arc<dyn LogHost> = Arc::new(MemoryLog::new());
-    let one = match driven(world, "a turn log open", OneLog::open(host, THREAD, Policy::default()))? {
+    let one = match driven(
+        world,
+        "a turn log open",
+        nanocode::turnlog::thread_scope_sim::open(host, THREAD, Policy::default()),
+    )? {
         Ok(one) => one,
         Err(error) => {
             flag(&world.wrong, format!("imports: the turn log opens: {error}"));

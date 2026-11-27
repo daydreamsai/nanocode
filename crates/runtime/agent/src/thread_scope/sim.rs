@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
+pub use crate::one_log::legacy::{claim, open};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Mutation {

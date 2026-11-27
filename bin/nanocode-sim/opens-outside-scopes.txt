@@ -1,3 +1,0 @@
-crates/nanocode/src/lib.rs 2
-crates/runtime/agent/src/one_log.rs 1
-crates/runtime/agent/src/one_log/over.rs 1

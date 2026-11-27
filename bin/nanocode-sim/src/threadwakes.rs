@@ -76,7 +76,11 @@ fn open(world: &World, wakes_max: usize) -> Option<Sides> {
         wakes_max: Some(wakes_max),
         ..Policy::default()
     };
-    let one = match driven(world, "a turn log open", OneLog::open(host, THREAD, policy))? {
+    let one = match driven(
+        world,
+        "a turn log open",
+        nanocode::turnlog::thread_scope_sim::open(host, THREAD, policy),
+    )? {
         Ok(one) => one,
         Err(error) => {
             flag(&world.wrong, format!("wakes: the turn log opens: {error}"));

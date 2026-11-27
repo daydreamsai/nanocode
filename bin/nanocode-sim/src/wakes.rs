@@ -368,8 +368,12 @@ impl Run {
         }
         self.host.revive();
         let host: Arc<dyn LogHost> = Arc::clone(&self.host) as Arc<dyn LogHost>;
-        let log = ready(OneLog::open(host, SCOPE, self.policy.clone()))
-            .map_err(|error| format!("reopen refused the log: {error}"))?;
+        let log = ready(nanocode::turnlog::thread_scope_sim::open(
+            host,
+            SCOPE,
+            self.policy.clone(),
+        ))
+        .map_err(|error| format!("reopen refused the log: {error}"))?;
         self.log = Some(Arc::clone(&log));
         self.recovered(&log)?;
         // Only a carried index is current before index_wakes backfills it.

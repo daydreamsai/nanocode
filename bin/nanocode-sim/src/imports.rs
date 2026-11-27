@@ -314,8 +314,12 @@ impl Run {
         }
         self.host.revive();
         let host: Arc<dyn LogHost> = Arc::clone(&self.host) as Arc<dyn LogHost>;
-        let log = ready(OneLog::open(host, SCOPE, self.policy.clone()))
-            .map_err(|error| format!("reopen refused the log: {error}"))?;
+        let log = ready(nanocode::turnlog::thread_scope_sim::open(
+            host,
+            SCOPE,
+            self.policy.clone(),
+        ))
+        .map_err(|error| format!("reopen refused the log: {error}"))?;
         self.log = Some(Arc::clone(&log));
         self.owned.clear();
         self.recovered(&log)?;
@@ -363,8 +367,12 @@ impl Run {
 
     fn durable(&self, state: &str, expected: &State) -> Result<(), String> {
         let host: Arc<dyn LogHost> = Arc::new(self.host.copy());
-        let reader = ready(OneLog::open(host, SCOPE, self.policy.clone()))
-            .map_err(|error| format!("a second reader refused the log: {error}"))?;
+        let reader = ready(nanocode::turnlog::thread_scope_sim::open(
+            host,
+            SCOPE,
+            self.policy.clone(),
+        ))
+        .map_err(|error| format!("a second reader refused the log: {error}"))?;
         let held = read(&reader, state, &self.keys(state))?;
         if held != *expected {
             return Err(format!(
@@ -447,8 +455,12 @@ impl Run {
     fn export(&mut self, state: &str, copy: bool) -> Result<(), String> {
         let (log, blip) = if copy {
             let host: Arc<dyn LogHost> = Arc::new(self.host.copy());
-            let reader = ready(OneLog::open(host, SCOPE, self.policy.clone()))
-                .map_err(|error| format!("an exporting reader refused the log: {error}"))?;
+            let reader = ready(nanocode::turnlog::thread_scope_sim::open(
+                host,
+                SCOPE,
+                self.policy.clone(),
+            ))
+            .map_err(|error| format!("an exporting reader refused the log: {error}"))?;
             (reader, false)
         } else {
             let log = self.open()?;

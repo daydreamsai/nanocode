@@ -3,12 +3,14 @@ use std::path::Path;
 
 use super::{code_only, counted, find, line_of, rust_sources, word_byte};
 
-const OPENS_ALLOWED: &str = "bin/nanocode-sim/opens-outside-scopes.txt";
 const OPENS_ROOTS: &[&str] = &["crates", "bin", "examples"];
 const OPENS_SKIPPED: &[&str] = &[
     "crates/patches",
     "crates/runtime/scope",
     "crates/core/turnlog/src/adopt.rs",
+    "crates/core/turnlog/src/legacy.rs",
+    "crates/core/turnlog/src/sim.rs",
+    "crates/runtime/agent/src/one_log/legacy.rs",
     "crates/core/turnlog/src/parted",
     "crates/integrations/store-sql/examples/plog.rs",
     "bin/nanocode-sim",
@@ -19,6 +21,8 @@ const OPENS: &[&str] = &[
     "TurnLog::follow(",
     "OneLog::open(",
     "OneLog::claim(",
+    "legacy::open(",
+    "legacy::claim(",
     "PartedLog::claim(",
     ".claim(part",
     ".claim(Partition(",
@@ -58,16 +62,16 @@ pub fn per_request_opens(code: &[u8]) -> Vec<(usize, String)> {
     opens
 }
 
-pub fn open_problems(sources: &[(String, String)], allowed: &str) -> Vec<String> {
-    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+pub fn open_problems(sources: &[(String, String)]) -> Vec<String> {
+    let mut problems = Vec::new();
     for (path, text) in sources {
         for (line, call) in per_request_opens(&code_only(text)) {
-            found.entry(path.clone()).or_default().push(format!(
-                "{path}:{line}: {call}..) opens, claims or follows a log outside the scope runtime; reach the scope through nanocode_scope::Scopes::get"
+            problems.push(format!(
+                "{path}:{line}: {call}..) opens, claims or follows a log outside the scope runtime; reach the scope through nanocode_scope::Scopes::get, ThreadLogs::get or OneLog::over"
             ));
         }
     }
-    counted(OPENS_ALLOWED, allowed, &found, "log opens outside the scope runtime")
+    problems
 }
 
 fn opens(root: &Path) -> std::io::Result<Vec<String>> {
@@ -75,7 +79,7 @@ fn opens(root: &Path) -> std::io::Result<Vec<String>> {
     for directory in OPENS_ROOTS {
         rust_sources(root, &root.join(directory), OPENS_SKIPPED, SKIPPED_DIRS, &mut sources)?;
     }
-    Ok(open_problems(&sources, &std::fs::read_to_string(root.join(OPENS_ALLOWED))?))
+    Ok(open_problems(&sources))
 }
 
 fn words(code: &[u8]) -> Vec<(usize, usize)> {

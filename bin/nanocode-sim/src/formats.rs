@@ -7,7 +7,7 @@ use nanocode_durability_core::StoreError;
 use nanocode_sync::block_on;
 use nanocode_turnlog::{
     Encoder, Format, FormatError, Formats, LogHost, MemoryLog, Point, Record, Release, SCAN_END,
-    Stamp, TurnLog, tagged_row,
+    Stamp, tagged_row,
     sim::{self as log_sim, Mutation as Rule},
 };
 use serde_json::value::RawValue;
@@ -198,7 +198,7 @@ async fn evented(rng: &mut Rng, host: Arc<dyn LogHost>) -> Result<(), String> {
     let row_limit = rng.chance(ROW_LIMIT_PPM).then(|| {
         usize::try_from(rng.range(ROW_BYTES.start, ROW_BYTES.end)).expect("a byte count fits")
     });
-    let log = TurnLog::open(host, THREAD)
+    let log = nanocode_turnlog::sim::open(host, THREAD)
         .await
         .map_err(failed)?
         .snapshot_ratio(SNAPSHOT_RATIO_NEVER)

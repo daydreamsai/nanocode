@@ -69,6 +69,26 @@ pub(crate) fn forced() -> Option<crate::Format> {
     }
 }
 
+pub async fn open(
+    host: std::sync::Arc<dyn crate::LogHost>,
+    scope: impl Into<std::sync::Arc<str>>,
+) -> Result<crate::TurnLog, nanocode_durability_core::StoreError> {
+    crate::TurnLog::open(host, scope).await
+}
+
+pub async fn follow(
+    host: std::sync::Arc<dyn crate::LogHost>,
+    scope: impl Into<std::sync::Arc<str>>,
+) -> Result<crate::Follower, nanocode_durability_core::StoreError> {
+    crate::TurnLog::follow(host, scope).await
+}
+
+pub async fn claim(
+    follower: crate::Follower,
+) -> Result<crate::TurnLog, nanocode_durability_core::StoreError> {
+    follower.claim().await
+}
+
 #[must_use]
 pub fn stamped(stamp: crate::Stamp, body: &str) -> String {
     crate::formats::stamp_row(stamp, body)

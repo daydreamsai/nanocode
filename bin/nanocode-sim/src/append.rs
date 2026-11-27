@@ -502,16 +502,15 @@ async fn commit(log: &TurnLog) -> Result<u64, StoreError> {
 
 impl World {
     async fn open(&self, scope: &str) -> Result<TurnLog, StoreError> {
-        Ok(TurnLog::open(Arc::clone(&self.host), scope)
+        Ok(nanocode_turnlog::sim::open(Arc::clone(&self.host), scope)
             .await?
             .row_limit(self.row_limit)
             .snapshot_ratio(SNAPSHOT_RATIO_NEVER))
     }
 
     async fn claim(&self, scope: &str) -> Result<TurnLog, StoreError> {
-        Ok(TurnLog::follow(Arc::clone(&self.host), scope)
-            .await?
-            .claim()
+        let follower = nanocode_turnlog::sim::follow(Arc::clone(&self.host), scope).await?;
+        Ok(nanocode_turnlog::sim::claim(follower)
             .await?
             .row_limit(self.row_limit)
             .snapshot_ratio(SNAPSHOT_RATIO_NEVER))

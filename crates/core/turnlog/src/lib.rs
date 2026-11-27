@@ -9,6 +9,7 @@ mod formats;
 mod hold;
 mod host;
 mod image;
+pub mod legacy;
 pub mod parted;
 mod patch;
 mod record;

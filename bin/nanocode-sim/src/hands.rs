@@ -910,7 +910,7 @@ fn step(index: usize) -> String {
 fn durable_step(host: &Arc<StepHost>, index: usize) -> bool {
     let host = Arc::clone(host) as Arc<dyn LogHost>;
     let read = async move {
-        let log = OneLog::open(host, SCOPE, policy())
+        let log = nanocode::turnlog::thread_scope_sim::open(host, SCOPE, policy())
             .await
             .expect("the simulated turn log opens");
         let mut store = log.store();
@@ -1847,7 +1847,7 @@ fn options(fleet: usize) -> AcceptorOptions {
 
 async fn opened(world: &World) -> Arc<OneLog> {
     let host = Arc::clone(&world.log) as Arc<dyn LogHost>;
-    let log = OneLog::open(host, SCOPE, policy())
+    let log = nanocode::turnlog::thread_scope_sim::open(host, SCOPE, policy())
         .await
         .expect("the simulated turn log opens");
     log.settle_durably();

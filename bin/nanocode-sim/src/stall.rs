@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use nanocode::turnlog::{OneLog, Policy, Statements, WakeRider, WakeSummary};
+use nanocode::turnlog::{Policy, Statements, WakeRider, WakeSummary};
 use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_sync::FutureExt;
 use nanocode_turnlog::{
@@ -189,8 +189,12 @@ impl WakeRider for StalledIndex {
 fn indexed(scope: &str, seq: u64, clock: &Arc<Clock>) {
     let (host, _) = opened(scope, &[]);
     let host: Arc<dyn LogHost> = host;
-    let log = ready(OneLog::open(host, scope, Policy::default()))
-        .unwrap_or_else(|error| panic!("{scope} does not open as a OneLog for a stall probe: {error}"));
+    let log = ready(nanocode::turnlog::thread_scope_sim::open(
+        host,
+        scope,
+        Policy::default(),
+    ))
+    .unwrap_or_else(|error| panic!("{scope} does not open as a OneLog for a stall probe: {error}"));
     let indexed = Rc::new(Cell::new(None));
     let read = Rc::new(Cell::new(None));
     let tasks = vec![
@@ -246,7 +250,7 @@ fn opened(scope: &str, stored: &[(u64, String)]) -> (Arc<StallHost>, TurnLog) {
         stall: AtomicU8::new(Stall::Answering as u8),
     });
     let opened: Arc<dyn LogHost> = host.clone();
-    let log = ready(TurnLog::open(opened, scope))
+    let log = ready(nanocode_turnlog::sim::open(opened, scope))
         .unwrap_or_else(|error| panic!("{scope} does not reopen before a stall probe: {error}"));
     (host, log)
 }
@@ -329,7 +333,7 @@ fn probe(scope: &str, stored: &[(u64, String)], seq: u64, stall: Stall, clock: &
     host.stall.store(Stall::Answering as u8, Ordering::SeqCst);
     drop(log);
     let reopened: Arc<dyn LogHost> = host.clone();
-    let log = ready(TurnLog::open(reopened, scope))
+    let log = ready(nanocode_turnlog::sim::open(reopened, scope))
         .unwrap_or_else(|error| panic!("{scope} does not reopen after a {stall:?} stall: {error}"));
     for (writer, end) in (0..WRITERS).zip(ended.iter()) {
         let (at_ns, committed) = end

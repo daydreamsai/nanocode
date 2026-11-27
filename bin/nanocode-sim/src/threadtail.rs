@@ -95,7 +95,12 @@ fn policy(bound: Option<usize>) -> Policy {
 }
 
 async fn open(host: &Arc<MemoryLog>, bound: Option<usize>) -> Result<Opened, StoreError> {
-    let log = OneLog::open(Arc::clone(host) as Arc<dyn LogHost>, SCOPE, policy(bound)).await?;
+    let log = nanocode::turnlog::thread_scope_sim::open(
+        Arc::clone(host) as Arc<dyn LogHost>,
+        SCOPE,
+        policy(bound),
+    )
+    .await?;
     let mut store = log.store();
     let owner = store.acquire(STATE, OwnerId::new()).await?.owner;
     Ok(Opened { log, store, owner })
@@ -169,7 +174,12 @@ async fn tail(host: &Arc<MemoryLog>) -> Result<Tail, StoreError> {
 }
 
 async fn resumed(host: &Arc<MemoryLog>, bound: Option<usize>) -> Result<Resumed, StoreError> {
-    let log = OneLog::open(Arc::clone(host) as Arc<dyn LogHost>, SCOPE, policy(bound)).await?;
+    let log = nanocode::turnlog::thread_scope_sim::open(
+        Arc::clone(host) as Arc<dyn LogHost>,
+        SCOPE,
+        policy(bound),
+    )
+    .await?;
     let mut store = log.store();
     let state = store.acquire(STATE, OwnerId::new()).await?.state;
     let mut queue: Vec<String> = state

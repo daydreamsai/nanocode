@@ -345,7 +345,7 @@ async fn open(disk: &Arc<Disk>, wire: &Arc<Wire>, inbox: &Arc<Inbox>) -> Result<
         snapshot_rows: None,
         wakes_max: None,
     };
-    let parts = nanocode::turnlog(log_host, "sim", policy)
+    let parts = crate::onelog::parts(log_host, "sim", policy)
         .await
         .map_err(|error| format!("turn log: {error}"))?;
     parts.log.settle_durably();

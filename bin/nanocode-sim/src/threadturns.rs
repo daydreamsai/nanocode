@@ -62,7 +62,7 @@ fn open(world: &World, host: &Arc<dyn LogHost>, policy: &Policy, generation: u64
     let one = driven(
         world,
         "a turn log open",
-        OneLog::open(Arc::clone(host), THREAD, policy.clone()),
+        nanocode::turnlog::thread_scope_sim::open(Arc::clone(host), THREAD, policy.clone()),
     );
     let one = match one? {
         Ok(one) => one,

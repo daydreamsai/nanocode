@@ -202,9 +202,10 @@ pub(crate) async fn write(
         snapshot_rows: Some(rows),
         ..Policy::default()
     };
-    let log = OneLog::open(Arc::clone(&host), thread.to_owned(), policy)
-        .await
-        .map_err(|error| format!("open the old writer: {error}"))?;
+    let log =
+        nanocode::turnlog::thread_scope_sim::open(Arc::clone(&host), thread.to_owned(), policy)
+            .await
+            .map_err(|error| format!("open the old writer: {error}"))?;
     let logs = StateStore::facts(&log.store())
         .ok_or_else(|| "the old writer offers no fact log".to_owned())?;
     let states: Vec<String> = (0..1 + rng.below(STATES))

@@ -443,7 +443,7 @@ impl Durable {
                     snapshot_rows: None,
                     wakes_max: None,
                 };
-                let parts = nanocode::turnlog(host, "sim", policy)
+                let parts = crate::onelog::parts(host, "sim", policy)
                     .await
                     .map_err(|error| format!("turn log: {error}"))?;
                 if self.settle_durably {

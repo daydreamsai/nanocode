@@ -278,8 +278,12 @@ fn says(output: &ToolOutput, text: &str) -> bool {
 impl World {
     fn open(&mut self) {
         let host: Arc<dyn LogHost> = Arc::clone(&self.host) as Arc<dyn LogHost>;
-        let log = block_on(OneLog::open(host, SCOPE, self.policy.clone()))
-            .unwrap_or_else(|error| panic!("the holds log opens: {error}"));
+        let log = block_on(nanocode::turnlog::thread_scope_sim::open(
+            host,
+            SCOPE,
+            self.policy.clone(),
+        ))
+        .unwrap_or_else(|error| panic!("the holds log opens: {error}"));
         let tools = Tools::builder()
             .without_defaults()
             .tool(Mailer {

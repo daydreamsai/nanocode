@@ -169,31 +169,6 @@ pub mod turnlog {
     }
 }
 
-pub async fn turnlog(
-    host: std::sync::Arc<dyn turnlog::LogHost>,
-    scope: &str,
-    policy: turnlog::Policy,
-) -> durability::Result<turnlog::Parts> {
-    parts(turnlog::OneLog::open(host, scope, policy).await?).await
-}
-
-pub async fn turnlog_claim(
-    follower: turnlog::Follower,
-    policy: turnlog::Policy,
-) -> durability::Result<turnlog::Parts> {
-    parts(turnlog::OneLog::claim(follower, policy).await?).await
-}
-
-async fn parts(log: std::sync::Arc<turnlog::OneLog>) -> durability::Result<turnlog::Parts> {
-    let store = session_store(log.store())?.with_logged_prompts();
-    let journals = log.journals().await?;
-    Ok(turnlog::Parts {
-        gate: log.gate(),
-        journals,
-        log,
-        store,
-    })
-}
 pub use nanocode_subagents::{
     AgentContext, AgentDescriptor, AgentId, AgentMessageUpdate, AgentStatus, AgentUpdate,
     RunningSubagents, ScopedAgentUpdate, SubagentCompletion, SubagentControl, SubagentRuntimeId,

@@ -6,7 +6,7 @@ use nanocode_durability_core::{
     StoredFact, TurnStatus, VALUE_INLINE_BYTES, Value,
 };
 use nanocode_turnlog::{
-    EffectClass, Event, Fold, Hold, LogHost, Phase, Point, Record, Turn, TurnLog, Wake, Writing,
+    EffectClass, Event, Fold, Hold, LogHost, Phase, Point, Record, Turn, Wake, Writing,
 };
 use serde::Serialize;
 use serde_json::{json, value::RawValue};
@@ -384,7 +384,7 @@ pub async fn write_named(
     thread: &str,
     prefix: &str,
 ) -> Result<Legacy, String> {
-    let log = TurnLog::open(host, thread)
+    let log = nanocode_turnlog::sim::open(host, thread)
         .await
         .map_err(failed("open a legacy turn log"))?
         .snapshot_rows(Some(
@@ -559,7 +559,7 @@ pub async fn expected(
     thread: &str,
     legacy: &Legacy,
 ) -> Result<View, String> {
-    let log = TurnLog::open(host, thread)
+    let log = nanocode_turnlog::sim::open(host, thread)
         .await
         .map_err(failed("reopen a legacy turn log"))?;
     let events = log

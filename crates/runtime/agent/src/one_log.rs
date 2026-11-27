@@ -16,8 +16,8 @@ use nanocode_tool_host::{
     hold::{HoldCall, HoldLedger, LedgerError, Running},
 };
 use nanocode_turnlog::{
-    Answer, EffectClass, Effects, Fold, HeldCall, Hold, LogHost, Outcome, Phase, Point, Record,
-    Resumption, Retired, Rider, Stats, Status, Turn, WakeRider, Writing, input_digest, tag,
+    Answer, EffectClass, Effects, Fold, HeldCall, Hold, Outcome, Phase, Point, Record, Resumption,
+    Retired, Rider, Stats, Status, Turn, WakeRider, Writing, input_digest, tag,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json, value::RawValue};
@@ -46,6 +46,7 @@ use crate::{
 mod export;
 mod facts;
 mod import;
+pub(crate) mod legacy;
 mod over;
 pub(crate) mod shared;
 mod wakes;
@@ -517,22 +518,7 @@ fn upgraded(this: &Weak<OneLog>) -> Arc<OneLog> {
 }
 
 impl OneLog {
-    pub async fn open(
-        host: Arc<dyn LogHost>,
-        scope: impl Into<Arc<str>>,
-        policy: Policy,
-    ) -> Result<Arc<Self>, StoreError> {
-        Self::opened(nanocode_turnlog::TurnLog::open(host, scope).await?, policy).await
-    }
-
-    pub async fn claim(
-        follower: nanocode_turnlog::Follower,
-        policy: Policy,
-    ) -> Result<Arc<Self>, StoreError> {
-        Self::opened(follower.claim().await?, policy).await
-    }
-
-    async fn opened(
+    pub(crate) async fn opened(
         log: nanocode_turnlog::TurnLog,
         policy: Policy,
     ) -> Result<Arc<Self>, StoreError> {
