@@ -162,6 +162,14 @@ impl ResponsesSocket {
             request.headers_mut().insert(TURN_STATE_HEADER, turn_state);
         }
         request.headers_mut().insert(
+            super::EXCLUDE_HEADER,
+            HeaderValue::from_static(super::EXCLUDED_FIELDS),
+        );
+        request.headers_mut().insert(
+            super::EXCLUDE_STREAM_FIELDS_HEADER,
+            HeaderValue::from_static(super::EXCLUDED_STREAM_FIELDS),
+        );
+        request.headers_mut().insert(
             "x-responsesapi-include-timing-metrics",
             HeaderValue::from_static("true"),
         );

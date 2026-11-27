@@ -234,6 +234,14 @@ impl<'a> HostConnectRequest<'a> {
         {
             headers.insert(TURN_STATE_HEADER, turn_state);
         }
+        headers.insert(
+            super::EXCLUDE_HEADER,
+            HeaderValue::from_static(super::EXCLUDED_FIELDS),
+        );
+        headers.insert(
+            super::EXCLUDE_STREAM_FIELDS_HEADER,
+            HeaderValue::from_static(super::EXCLUDED_STREAM_FIELDS),
+        );
         headers.insert(header::USER_AGENT, HeaderValue::from_static(USER_AGENT));
         Ok(headers)
     }

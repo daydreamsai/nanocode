@@ -10,6 +10,8 @@
   "header:originator": "nanocode identifies itself as nanocode and sends no codex_exec originator.",
   "header:user-agent": "nanocode identifies itself as nanocode/<version>, not codex_exec.",
   "header:x-codex-beta-features": "codex-cli announces remote_compaction_v2; nanocode compacts on its own side and does not implement it, so it announces nothing.",
+  "header:x-codex-exclude": "nanocode asks the server to leave the echoed tool catalog and per-item usage attribution out of response events, as codex-cli does after 0.169 (openai/codex#62863, #63219); nanocode reads neither.",
+  "header:x-codex-exclude-stream-fields": "nanocode asks the server to leave sequence numbers out of deltas and the preliminary reasoning ciphertext out of output_item.added, as codex-cli does after 0.169 (openai/codex#63461, #63479); nanocode reads only the finished item's ciphertext and no sequence numbers.",
   "header:x-codex-turn-metadata": "codex-cli sends the turn metadata as a header and in client_metadata; nanocode sends it only in client_metadata (the channel its WebSocket transport uses), with session, thread and turn ids, request_kind and tool_namespaces_info, and none of codex-cli's installation, window, sandbox or analytics fields.",
   "header:x-codex-window-id": "codex-cli numbers its compaction windows (<session>:<n>); nanocode has no window counter to report.",
   "input:developer:collaboration_mode": "Part of codex-cli 0.169's multi-agent surface (see tool:collaboration.spawn_agent).",

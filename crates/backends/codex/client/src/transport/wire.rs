@@ -99,6 +99,11 @@ pub(crate) fn turn_state_from_event(text: &str) -> Option<String> {
 }
 
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+pub(crate) const EXCLUDE_HEADER: &str = "x-codex-exclude";
+pub(crate) const EXCLUDED_FIELDS: &str = "tools,usage.attribution";
+pub(crate) const EXCLUDE_STREAM_FIELDS_HEADER: &str = "x-codex-exclude-stream-fields";
+pub(crate) const EXCLUDED_STREAM_FIELDS: &str =
+    "delta.sequence_number,reasoning.added.encrypted_content";
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]

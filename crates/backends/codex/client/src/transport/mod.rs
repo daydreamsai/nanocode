@@ -23,6 +23,9 @@ pub(crate) mod platform;
 pub(crate) mod socket;
 pub(crate) mod telemetry;
 mod wire;
+pub(crate) use wire::{
+    EXCLUDE_HEADER, EXCLUDE_STREAM_FIELDS_HEADER, EXCLUDED_FIELDS, EXCLUDED_STREAM_FIELDS,
+};
 
 use std::{fmt, str::FromStr};
 

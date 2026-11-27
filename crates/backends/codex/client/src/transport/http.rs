@@ -172,6 +172,11 @@ impl ResponsesHttp {
             .header("session-id", session_id)
             .header("thread-id", thread_id)
             .header("x-client-request-id", thread_id)
+            .header(super::EXCLUDE_HEADER, super::EXCLUDED_FIELDS)
+            .header(
+                super::EXCLUDE_STREAM_FIELDS_HEADER,
+                super::EXCLUDED_STREAM_FIELDS,
+            )
             .header(
                 header::USER_AGENT,
                 concat!("nanocode/", env!("CARGO_PKG_VERSION")),
