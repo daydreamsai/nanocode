@@ -189,6 +189,8 @@ pub struct ThreadScopeStats {
     pub session_bytes_max: u64,
     pub session_checks: u64,
     pub session_blobs_checked: u64,
+    pub session_caches: u64,
+    pub session_rows_bytes: u64,
     pub adoption_bytes: u64,
     pub stamps_settled: u64,
     pub stamps_uncertain: u64,
@@ -257,6 +259,8 @@ impl ThreadScopeStats {
         self.session_bytes_max = self.session_bytes_max.max(other.session_bytes_max);
         self.session_checks += other.session_checks;
         self.session_blobs_checked += other.session_blobs_checked;
+        self.session_caches += other.session_caches;
+        self.session_rows_bytes += other.session_rows_bytes;
         self.adoption_bytes += other.adoption_bytes;
         self.stamps_settled += other.stamps_settled;
         self.stamps_uncertain += other.stamps_uncertain;
@@ -1803,6 +1807,18 @@ fn seeded(seed: u64, mutation: ThreadScopeMutation, time: &Arc<Clock>) -> Outcom
         stats.checkpoint_parts_kept += runtime.checkpoint_parts_kept;
         stats.evictions += runtime.evictions;
         stats.forwards += runtime.forwards;
+    }
+    for (thread, sessions) in world.sessions.borrow().iter() {
+        let rows = world.rows(thread);
+        stats.session_rows_bytes += rows
+            .iter()
+            .filter(|(seq, _)| *seq >= sessions.next)
+            .map(|(_, body)| body.len() as u64)
+            .sum::<u64>();
+        match threadsessions::cached(&records(&rows, sessions.next, u64::MAX), thread, sessions) {
+            Ok(checked) => stats.session_caches += checked,
+            Err(error) => flag(&world.wrong, format!("sessions: {error}")),
+        }
     }
     let histories = world.legacy.len() + world.sessions.borrow().len();
     if stats.adoptions > histories as u64 {

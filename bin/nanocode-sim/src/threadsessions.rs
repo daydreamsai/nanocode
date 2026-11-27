@@ -9,7 +9,7 @@ use nanocode_durability_core::{
     Decision, DurableFold, Fact, FactLog, FactLogs, FoldError, Folded, Input, InputKind, ModelOut,
     OwnedFact, Seen, StateStore, VALUE_INLINE_BYTES, Value, commit_fact, fold_facts,
 };
-use nanocode_turnlog::CachedAt;
+use nanocode_turnlog::{CachedAt, Record, SNAPSHOT_RATIO, cache_key};
 use serde::{Deserialize, Serialize};
 use serde_json::{
     Map,
@@ -320,6 +320,45 @@ pub(crate) fn held(state: &ThreadState, thread: &str, sessions: &Sessions) -> Re
         );
         named.map(drop)?;
         checked += 1;
+    }
+    Ok(checked)
+}
+
+pub(crate) fn cached(records: &[Record], thread: &str, sessions: &Sessions) -> Result<u64, String> {
+    let mut checked = 0;
+    for expected in &sessions.expected {
+        let key = cache_key(&expected.state);
+        let mut uncached = 0_u64;
+        let mut last: Option<u64> = None;
+        for record in records {
+            match record {
+                Record::Fact {
+                    fact,
+                    state: Some(state),
+                    ..
+                } if *state == expected.state => {
+                    uncached += serde_json::to_string(fact)
+                        .map_err(|error| error.to_string())?
+                        .len() as u64;
+                }
+                Record::Host { key: written, value } if *written == key => {
+                    let at: CachedAt = serde_json::from_str(value.get())
+                        .map_err(|error| format!("a cached fold of {thread}: {error}"))?;
+                    if let Some(bytes) = last
+                        && uncached <= SNAPSHOT_RATIO as u64 * bytes
+                    {
+                        return Err(format!(
+                            "{thread} rewrote the {}-byte cached fold of {} after {uncached} bytes of facts",
+                            bytes, expected.state
+                        ));
+                    }
+                    last = Some(at.bytes);
+                    uncached = 0;
+                    checked += 1;
+                }
+                _ => {}
+            }
+        }
     }
     Ok(checked)
 }

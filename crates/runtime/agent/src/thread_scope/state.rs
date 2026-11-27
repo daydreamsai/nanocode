@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use nanocode_sync::{OrdMap, OrdSet, Vector};
 use nanocode_turnlog::{
-    ArmedWake, Checkpoint, EffectClass, Event, FOLD_SNAPSHOT_KEY, Hold, OpenCall, Outcome, Phase,
+    ArmedWake, CachedAt, Checkpoint, EffectClass, Event, FOLD_SNAPSHOT_KEY, Hold, OpenCall, Outcome, Phase,
     Record, Recovered, Retry, SNAPSHOT_RATIO, Status, Turn, apply_patch, cache_key, input_digest,
     internal_host,
 };
@@ -472,9 +472,15 @@ impl ThreadState {
 
     #[must_use]
     pub fn cache_due(&self, state: &str) -> bool {
-        let cached = self
-            .cached_state(state)
-            .map_or(0, |value| value.get().len() as u64);
+        let cached = match self.cached_state(state) {
+            Some(value) if super::sim::mutated(super::sim::Mutation::CacheDueIgnoresBlob) => {
+                value.get().len() as u64
+            }
+            Some(_) if self.cached_row(state).is_none() => 0,
+            Some(value) => serde_json::from_str::<CachedAt>(value.get())
+                .map_or(value.get().len() as u64, |at| at.bytes),
+            None => 0,
+        };
         self.uncached
             .get(state)
             .is_some_and(|bytes| *bytes > SNAPSHOT_RATIO as u64 * cached)

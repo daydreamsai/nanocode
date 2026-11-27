@@ -35,10 +35,11 @@ pub enum Mutation {
     OpenPerRequest,
     ResidentDropsBlob,
     LegacyOpenClaims,
+    CacheDueIgnoresBlob,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::PartDropped,
         Self::AdoptionSkipsRetired,
         Self::AdoptionSkipsBlobs,
@@ -66,6 +67,7 @@ impl Mutation {
         Self::TailUnbounded,
         Self::OpenPerRequest,
         Self::ResidentDropsBlob,
+        Self::CacheDueIgnoresBlob,
     ];
 
     #[must_use]
@@ -101,6 +103,7 @@ impl Mutation {
             Self::OpenPerRequest => "open_per_request",
             Self::ResidentDropsBlob => "resident_drops_blob",
             Self::LegacyOpenClaims => "legacy_open_claims",
+            Self::CacheDueIgnoresBlob => "cache_due_ignores_blob",
         }
     }
 
