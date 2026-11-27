@@ -486,6 +486,7 @@ default_table='
 1 canary_admission_admission_unbounded canary:8 --scenario admission --mutation admission_unbounded
 1 canary_admission_cold_load_duplicated canary:8 --scenario admission --mutation cold_load_duplicated
 1 canary_admission_meter_skips_writer_task canary:8 --scenario admission --mutation meter_skips_writer_task
+1 canary_admission_admission_busy_fatal canary:8 --scenario admission --mutation admission_busy_fatal
 4 thread_scope pass --scenario thread_scope
 1 thread_scope_twice pass --scenario thread_scope --twice
 1 canary_thread_scope_part_dropped canary:16 --scenario thread_scope --mutation part_dropped

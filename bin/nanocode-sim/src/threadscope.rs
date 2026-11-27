@@ -407,6 +407,11 @@ impl World {
         !self.witness.manifests(thread).is_empty()
     }
 
+    pub(crate) const fn admitting(mut self, admit_ms: u64) -> Self {
+        self.policy.admit_ms = admit_ms;
+        self
+    }
+
     pub(crate) fn keeping(mut self, rows: usize) -> Self {
         self.thread.recent_rows = rows;
         self.fold = ThreadFold::new(self.thread);

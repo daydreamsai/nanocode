@@ -13,6 +13,7 @@ pub enum Mutation {
     CellJournalKeepsHead,
     CarryIgnoresEarlierRead,
     CarryIgnoresPrunedReceipts,
+    AdmissionBusyFatal,
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);

@@ -69,6 +69,11 @@ pub fn agent_error(error: Error) -> NanocodeError {
         Error::Store(StoreError::NotCommitted(_))
         | Error::OperationBlocked { .. }
         | Error::OperationActive { .. } => ExecutionPolicyDisposition::Retry,
+        Error::Store(StoreError::Unadmitted { .. })
+            if crate::sim::mutated(crate::sim::Mutation::AdmissionBusyFatal) =>
+        {
+            ExecutionPolicyDisposition::Fatal
+        }
         Error::Store(
             StoreError::Fenced
             | StoreError::Unadmitted { .. }

@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use nanocode_durability::sim::{self as durability_sim, Mutation as DurabilityMutation};
 use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_scope::{
     Checkpoints, Committed, MemoryCheckpoints, Part, PartedLeases, Policy, Reached, Resident,
@@ -23,6 +24,7 @@ use nanocode_turnlog::{
 };
 
 use crate::{
+    admitturns::{self, TurnStats},
     executor::{Clock, Ended, Executor, Task},
     rng::{FNV_OFFSET, Rng, fnv},
 };
@@ -43,30 +45,56 @@ const START_MS: u64 = 1_000_000;
 const STATE_BYTES: usize = 8;
 const NODE: &str = "n0";
 
+const BUSY_FATAL: &str = "admission_busy_fatal";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AdmissionMutation(Mutation);
+pub enum AdmissionMutation {
+    Scope(Mutation),
+    BusyFatal,
+}
 
 impl AdmissionMutation {
-    pub const NONE: Self = Self(Mutation::None);
+    pub const NONE: Self = Self::Scope(Mutation::None);
 
     pub fn parse(name: &str) -> Option<Self> {
+        if name == BUSY_FATAL {
+            return Some(Self::BusyFatal);
+        }
         Mutation::parse(name)
             .filter(|mutation| {
                 *mutation == Mutation::None || Mutation::ADMISSION.contains(mutation)
             })
-            .map(Self)
+            .map(Self::Scope)
     }
 
     pub const fn name(self) -> &'static str {
-        self.0.name()
+        match self {
+            Self::Scope(mutation) => mutation.name(),
+            Self::BusyFatal => BUSY_FATAL,
+        }
     }
 
     pub fn names() -> String {
         Mutation::ADMISSION
             .iter()
             .map(|mutation| mutation.name())
+            .chain(std::iter::once(BUSY_FATAL))
             .collect::<Vec<_>>()
             .join("|")
+    }
+
+    const fn scope(self) -> Mutation {
+        match self {
+            Self::Scope(mutation) => mutation,
+            Self::BusyFatal => Mutation::None,
+        }
+    }
+
+    const fn durability(self) -> DurabilityMutation {
+        match self {
+            Self::Scope(_) => DurabilityMutation::None,
+            Self::BusyFatal => DurabilityMutation::AdmissionBusyFatal,
+        }
     }
 }
 
@@ -80,6 +108,7 @@ pub struct AdmissionStats {
     pub sends: u64,
     pub history_reads: u64,
     pub history_busy: u64,
+    pub turns: TurnStats,
 }
 
 impl AdmissionStats {
@@ -92,6 +121,7 @@ impl AdmissionStats {
         self.sends += other.sends;
         self.history_reads += other.history_reads;
         self.history_busy += other.history_busy;
+        self.turns.add(&other.turns);
     }
 }
 
@@ -581,6 +611,9 @@ fn seeded(seed: u64, clock: &Arc<Clock>) -> Outcome {
     let handles = loaded(&answers);
     sends(&mut world, &mut rng, &handles, &mut stats);
     history(&mut world, &mut rng, &handles, &mut stats);
+    world
+        .wrong
+        .extend(admitturns::run(&mut rng, clock, &mut stats.turns));
     let shape = format!(
         "capacity={} scopes={} gets={} loaded={}",
         world.capacity,
@@ -592,6 +625,9 @@ fn seeded(seed: u64, clock: &Arc<Clock>) -> Outcome {
     for (name, scope) in &handles {
         digest = fnv(fnv(digest, name.as_bytes()), &scope.state().to_le_bytes());
     }
+    for count in [stats.turns.refusals, stats.turns.healed, stats.turns.late] {
+        digest = fnv(digest, &count.to_le_bytes());
+    }
     Outcome {
         digest,
         wrong: world.wrong.into_iter().next(),
@@ -601,10 +637,12 @@ fn seeded(seed: u64, clock: &Arc<Clock>) -> Outcome {
 }
 
 fn run_seed(seed: u64, mutation: AdmissionMutation) -> Outcome {
-    scope_sim::mutate(mutation.0);
+    scope_sim::mutate(mutation.scope());
+    durability_sim::mutate(mutation.durability());
     let clock = Clock::new();
     let outcome = crate::host::entered(seed, &clock, || seeded(seed, &clock));
     scope_sim::mutate(Mutation::None);
+    durability_sim::mutate(DurabilityMutation::None);
     outcome
 }
 
