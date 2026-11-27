@@ -28,6 +28,7 @@ pub enum Mutation {
     JournalLostUnretried,
     ScopeWritesUntagged,
     ScopeStartsAtRowZero,
+    FlipOffUnreadable,
 }
 
 impl Mutation {
@@ -86,6 +87,7 @@ impl Mutation {
             Self::JournalLostUnretried => "journal_lost_unretried",
             Self::ScopeWritesUntagged => "scope_writes_untagged",
             Self::ScopeStartsAtRowZero => "scope_starts_at_row_zero",
+            Self::FlipOffUnreadable => "flip_off_unreadable",
         }
     }
 

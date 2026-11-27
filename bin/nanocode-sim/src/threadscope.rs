@@ -347,6 +347,14 @@ impl World {
         Arc::clone(&self.host)
     }
 
+    pub(crate) const fn fold(&self) -> &ThreadFold {
+        &self.fold
+    }
+
+    pub(crate) fn expire(&self) {
+        self.db.fetch_add(TTL_MS + GRACE_MS + MARGIN_MS, Ordering::Relaxed);
+    }
+
     pub(crate) fn checkpointed(&self, thread: &str) -> bool {
         !self.witness.manifests(thread).is_empty()
     }
@@ -1399,7 +1407,7 @@ fn run_seed(seed: u64, mutation: ThreadScopeMutation) -> Outcome {
     crate::host::entered(seed, &time, || seeded(seed, mutation, &time))
 }
 
-fn world(rng: &mut Rng, time: &Arc<Clock>) -> World {
+pub(crate) fn world(rng: &mut Rng, time: &Arc<Clock>) -> World {
     let db = Arc::new(AtomicU64::new(START_MS));
     let clock = Arc::clone(&db);
     let store =

@@ -1,4 +1,10 @@
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use nanocode_scope::{
     Adopted, Carry, Flushed, Part, Reached, Resident, ScopeError, Scopes, Wiring,
@@ -29,6 +35,7 @@ pub mod history;
 mod import;
 mod journals;
 mod parts;
+mod path;
 pub mod sim;
 mod state;
 mod store;
@@ -40,6 +47,8 @@ pub use facts::ThreadFacts;
 pub(crate) use holds::HoldsError;
 pub use holds::ThreadHolds;
 pub use journals::ThreadJournals;
+pub(crate) use path::legacy_refused;
+pub use path::{ThreadPath, ThreadPaths};
 pub use state::{
     FinishedFilter, Found, KeptEvent, KeptFact, Legacy, Moved, Probe, Probes, Probing, Reserved,
     ThreadState, Window,
@@ -271,6 +280,7 @@ pub struct ThreadPolicy {
 
 pub struct ThreadFold {
     policy: ThreadPolicy,
+    flips: AtomicU64,
 }
 
 impl ThreadFold {
@@ -289,12 +299,25 @@ impl ThreadFold {
             policy.finished_filter.hashes > 0,
             "a finished turn filter sets at least one bit per turn"
         );
-        Self { policy }
+        Self {
+            policy,
+            flips: AtomicU64::new(0),
+        }
     }
 
     #[must_use]
     pub const fn policy(&self) -> ThreadPolicy {
         self.policy
+    }
+
+    #[must_use]
+    pub fn flips(&self) -> u64 {
+        self.flips.load(Ordering::Relaxed)
+    }
+
+    fn untagged(&self) -> bool {
+        sim::mutated(sim::Mutation::ScopeWritesUntagged)
+            || (sim::mutated(sim::Mutation::FlipOffUnreadable) && self.flips() > 0)
     }
 }
 
@@ -686,7 +709,7 @@ impl Resident for ThreadFold {
         if records.is_empty() {
             return (Vec::new(), reply);
         }
-        let encoded = if sim::mutated(sim::Mutation::ScopeWritesUntagged) {
+        let encoded = if self.untagged() {
             nanocode_turnlog::encode(&records)
         } else {
             nanocode_turnlog::standalone_row(&records)
@@ -759,6 +782,8 @@ pub struct ThreadLogs {
     scopes: Scopes<ThreadFold>,
     host: Arc<dyn LogHost>,
     policy: ThreadPolicy,
+    fold: Arc<ThreadFold>,
+    paths: Option<Arc<dyn ThreadPaths>>,
 }
 
 impl ThreadLogs {
@@ -771,8 +796,40 @@ impl ThreadLogs {
         Self {
             host: Arc::clone(&wiring.log),
             policy: wiring.fold.policy,
+            fold: Arc::clone(&wiring.fold),
+            paths: None,
             scopes: Scopes::new(wiring),
         }
+    }
+
+    #[must_use]
+    pub fn with_paths(mut self, paths: Arc<dyn ThreadPaths>) -> Self {
+        self.paths = Some(paths);
+        self
+    }
+
+    #[must_use]
+    pub fn path(&self, thread: &str) -> ThreadPath {
+        self.paths
+            .as_ref()
+            .map_or(ThreadPath::Resident, |paths| paths.path(thread))
+    }
+
+    #[must_use]
+    pub fn flips(&self) -> u64 {
+        self.fold.flips()
+    }
+
+    pub(crate) fn flipped(&self) {
+        let before = self.fold.flips.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            before < u64::MAX,
+            "a thread's flips are counted without wrapping"
+        );
+    }
+
+    pub(crate) fn host(&self) -> Arc<dyn LogHost> {
+        Arc::clone(&self.host)
     }
 
     #[must_use]
@@ -781,6 +838,15 @@ impl ThreadLogs {
     }
 
     pub async fn get(&self, thread: &str) -> Result<ThreadLog, ScopeError> {
+        if self.path(thread) == ThreadPath::Legacy {
+            return Err(ScopeError::Store(StoreError::NotCommitted(
+                path::legacy_refused(thread),
+            )));
+        }
+        self.reach(thread).await
+    }
+
+    pub(crate) async fn reach(&self, thread: &str) -> Result<ThreadLog, ScopeError> {
         Ok(ThreadLog {
             reached: self.scopes.get(thread).await?,
             host: Arc::clone(&self.host),

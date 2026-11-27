@@ -1,6 +1,7 @@
 crates/integrations/store-sql/examples/plog.rs 4
 crates/nanocode/src/lib.rs 2
 crates/runtime/agent/src/one_log.rs 1
+crates/runtime/agent/src/one_log/over.rs 1
 crates/runtime/agent/src/one_log_tail_tests.rs 1
 examples/dispatch-pg/src/main.rs 1
 examples/scoped-api/src/replica.rs 1

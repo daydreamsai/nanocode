@@ -37,8 +37,8 @@ pub use session_log::{
 pub use thread_scope::{
     Done, FinishedFilter, Found, Job, KeptEvent, KeptFact, Lease, Legacy, Moved, Probe, Probes,
     Probing, Reserved, Staged, ThreadCommand, ThreadFacts, ThreadFold, ThreadHolds,
-    ThreadJournals, ThreadLog, ThreadLogs, ThreadPolicy, ThreadReply, ThreadState, ThreadStore,
-    ThreadTurns, ThreadWakes, Window, history as thread_history,
+    ThreadJournals, ThreadLog, ThreadLogs, ThreadPath, ThreadPaths, ThreadPolicy, ThreadReply,
+    ThreadState, ThreadStore, ThreadTurns, ThreadWakes, Window, history as thread_history,
     sim as thread_scope_sim,
 };
 pub use turn_inbox::{

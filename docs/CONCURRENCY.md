@@ -21,7 +21,7 @@ Status (2026-11-25): nanocode-sync has no exclusive guard type left (`Sequencer`
 11. **Every row format is readable by the previous release.** Every row begins with its format version, and decoders live in one registry keyed by version. A writer writes only the newest version the previous release decodes, which `bin/nanocode-sim/formats.txt` records (version, the first release that decodes it, and the digest of the encoder sources). A new version therefore lands decoder first: release N reads it, and release N+1 may write it. Writing a version the previous release can't read is a typed refusal at construction, not a deploy-time surprise.
 12. **Every scope's database work is counted by the runtime.** `Scopes::new` wraps the `LogHost` and checkpoint store it is given in a meter keyed by the scope each call names, so work on any task (writer tasks, group commits, adoption, checkpoints, history pages) counts against the scope that caused it. `Scopes::stats` and `Scope::usage` report calls, rows, bytes and time per class (load, append, checkpoint, adopt, history). Attribution never depends on task-locals or on what the host wires.
 13. **Nanocode admits its own reads.** Every cold claim, adoption and history read passes one process-wide admission whose capacity is the read capacity the `LogHost` reports (`LogHost::read_capacity`, from the pool's read connections in store-sql), never a second number the host picks. Concurrent gets of one cold scope share one load. A waiter's deadline is `Policy::admit_ms`, and past it the answer is `Busy`. The pool is never asked for more connections than it holds, so a deploy's burst of cold claims becomes a bounded queue with deadlines, not a pool storm.
-14. **On-disk switches are reversible and flipped in the simulator.** An option that changes what reaches disk (the thread path, the row format and stamps, the checkpoint layout) is an `OnDisk` switch in one registry, and it can be flipped on, off and on again at any point in a scope's life without losing a write or leaving a row the other setting can't read. A switch that can't be undone has no constructor.
+14. **On-disk switches are reversible and flipped in the simulator.** An option that changes what reaches disk (the thread path, the row format and stamps, the checkpoint layout) is an `OnDisk` switch in one registry, `nanocode_scope::switches::ON_DISK`. It can be flipped on, off and on again at any point in a scope's life without losing a write or leaving a row the other setting can't read. `OnDisk::new` takes a `Flipped` proof, the name of the simulator scenario that flips the switch, so a switch that can't be undone has no constructor.
 
 ## Invariants
 
@@ -125,7 +125,7 @@ Rules 9-14 take the failures a host could cause by calling nanocode carelessly a
 | 11 | A row format the previous release can't decode makes a rollback unreadable | **I15** `--scenario formats`: a frozen corpus of every version decodes with the current registry and with the previous release's, and a writer's rows decode with the previous release's | `writes_unreleased_format` | a change to an encoder source whose digest `formats.txt` doesn't record (so the corpus and the N-1 read are regenerated with it) |
 | 12 | Work a scope did on a writer task went uncounted | **I16** every call the simulator's host serves is counted against the scope it named, and the meter's totals equal the host's | `meter_skips_writer_task` | a `task_local!` in `crates/`; a `LogHost` call in the scope runtime that bypasses the meter |
 | 13 | Host pool sizing let a burst of cold claims starve and flood the pool | **I17** `--scenario admission`: thousands of cold gets at once over a host of capacity C keep at most C reads in flight, load each scope once, and answer every get within `admit_ms` plus the load bound | `admission_unbounded`, `cold_load_duplicated` | a `Semaphore::new` with a literal capacity in `crates/`; a pool built outside store-sql's limits |
-| 14 | A switch that changes disk behaviour can't be turned back off | **I18** `--scenario flips`: every registered switch flipped on, off and on mid-run across crashes and handoffs; after each flip both settings and the previous release's decoder agree on every scope's state | `flip_off_unreadable` | an `OnDisk` switch the flips scenario doesn't drive |
+| 14 | A switch that changes disk behaviour can't be turned back off | **I18** `--scenario flips`: every registered switch flipped on, off and on mid-run across crashes and handoffs; after each flip and move the previous release's decoder reads every row, every acknowledged write reads back, and both settings agree on the thread's state | `flip_off_unreadable` (a resident thread writes untagged rows after its first flip) | an `OnDisk::new` outside the registry, a switch missing from `ON_DISK`, and a switch whose proof is not `flips` or that `DRIVEN` in `bin/nanocode-sim/src/flips.rs` does not name |
 
 ### Stamps
 
@@ -133,7 +133,15 @@ A stamp is part of the row's format, not a column, so it reaches every `LogHost`
 
 ### One entry, two paths
 
-`ThreadLogs::get` serves every thread. `ThreadPath::Resident` folds it as a resident scope; `ThreadPath::Legacy` runs the old writer behind the same handle and the same `OneLogOver` operations. The path is a switch (rule 14) set per thread by the host's policy, so a host ramps and rolls back by flipping it, and both paths write rows the other reads.
+`ThreadPath` (`Resident` or `Legacy`) is the `thread_path` switch of rule 14. A host sets it per thread through a `ThreadPaths` policy given to `ThreadLogs::with_paths`, and every node reads the same policy. `OneLog::over` serves a thread on the path the policy names, with the same `OneLogOver` operations on both.
+
+On `Legacy` the facade claims the scope through `Scopes`, drains it with a final checkpoint, and runs the old `OneLog` writer over the same `LogHost`. Only the partition's holder serves a legacy thread, and a host never calls `OneLog::open` or `OneLog::claim` to roll back. A write the old writer loses to a fence opens it again once.
+
+Flipping back commits the old writer's buffered rows, and the next resident claim adopts what it wrote. `ThreadLogs::get` refuses a legacy thread, so no resident owner races the old writer in one process. `store()` and `journals()` remain the resident handles. `states()` and `sink()` answer for the path that serves, and `read` refuses on `Legacy`, which keeps no resident state. `ThreadLogs::flips` counts the flips a node served.
+
+`nanocode-sim --scenario flips` drives every switch in `ON_DISK` from its `DRIVEN` table. Each seed runs 3-8 rounds on one thread, half of them over an old-writer history. A round submits, starts, appends, finishes and cancels turns through `OneLogOver`, sometimes crashes or hands off the node, then flips the path.
+
+After every flip and move the previous release's row decoder reads every row, and each acknowledged turn reads back in its answered state. The turn log's own view must equal the resident fold of the same rows, and the live resident state on `Resident`. A start is staged, so only a crash or a legacy handoff may lose it.
 
 ### Admission and metering
 
@@ -229,7 +237,7 @@ Locations are paths at master. "Rule" is the rule broken. "Replacement" is what 
 | No format registry | `crates/core/turnlog/src/codec.rs` tags and `writer.rs` "no known tag" | 11 | A versioned decoder registry and `formats.txt` |
 | Host-wired SQL attribution | none in nanocode; a host tallies by task-local and misses writer tasks | 12 | The meter in `Scopes` |
 | Host-sized reads | `PgLimits` and pool sizes set by the host; cold claims unbounded in `Scopes::get` | 13 | Admission from `LogHost::read_capacity` |
-| Unregistered on-disk switches | the thread path and row format chosen by the host outside nanocode | 14 | `OnDisk` registry and `--scenario flips` |
+| Unregistered row format | the row format version, chosen outside the `ON_DISK` registry | 14 | An `OnDisk` entry for the format registry's version, flipped in `--scenario flips` |
 
 ### DDL on the request path
 

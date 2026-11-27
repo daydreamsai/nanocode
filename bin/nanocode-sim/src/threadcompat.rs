@@ -34,7 +34,7 @@ pub(crate) fn run(rng: &mut Rng, world: &World, stats: &mut ThreadScopeStats) {
         );
         return;
     }
-    if previous(world, "after a resident stint").is_none()
+    if previous(world, THREAD, "after a resident stint").is_none()
         || opened(world, &host, &ids, "after a resident stint").is_none()
     {
         return;
@@ -43,7 +43,7 @@ pub(crate) fn run(rng: &mut Rng, world: &World, stats: &mut ThreadScopeStats) {
         return;
     };
     ids.extend(legacy.ids().iter().cloned());
-    if previous(world, "after the old path wrote").is_none() {
+    if previous(world, THREAD, "after the old path wrote").is_none() {
         return;
     }
     let Some(adoptions) = stint(rng, world, "compat1", &mut turns, &mut ids, stats) else {
@@ -56,7 +56,7 @@ pub(crate) fn run(rng: &mut Rng, world: &World, stats: &mut ThreadScopeStats) {
         );
         return;
     }
-    if previous(world, "after a second resident stint").is_none()
+    if previous(world, THREAD, "after a second resident stint").is_none()
         || opened(world, &host, &ids, "after a second resident stint").is_none()
     {
         return;
@@ -111,6 +111,7 @@ fn stint(
     let host = world.host();
     resident(
         world,
+        THREAD,
         &host,
         &claimed,
         ids,
@@ -144,6 +145,7 @@ fn stint(
     };
     resident(
         world,
+        THREAD,
         &host,
         &state,
         ids,
@@ -175,8 +177,9 @@ fn stint(
     Some(adoptions)
 }
 
-fn resident(
+pub(crate) fn resident(
     world: &World,
+    thread: &str,
     host: &Arc<dyn LogHost>,
     state: &ThreadState,
     ids: &[String],
@@ -186,7 +189,7 @@ fn resident(
     let theirs = match driven(
         world,
         "a compat turn log view",
-        threadlegacy::expected(Arc::clone(host), THREAD, &probe),
+        threadlegacy::expected(Arc::clone(host), thread, &probe),
     )? {
         Ok(theirs) => theirs,
         Err(error) => {
@@ -201,12 +204,12 @@ fn resident(
     let events = driven(
         world,
         "a compat history read",
-        thread_history::events(host, THREAD, state, 0, paging),
+        thread_history::events(host, thread, state, 0, paging),
     )?;
     let facts = driven(
         world,
         "a compat fact read",
-        thread_history::facts(host, THREAD, state, 0, None),
+        thread_history::facts(host, thread, state, 0, None),
     )?;
     let (Ok(events), Ok(facts)) = (events, facts) else {
         flag(
@@ -228,8 +231,8 @@ fn resident(
     Some(())
 }
 
-fn previous(world: &World, when: &str) -> Option<()> {
-    let rows = world.rows(THREAD);
+pub(crate) fn previous(world: &World, thread: &str, when: &str) -> Option<()> {
+    let rows = world.rows(thread);
     if let Some((seq, _)) = rows.iter().find(|(_, body)| {
         !body
             .chars()

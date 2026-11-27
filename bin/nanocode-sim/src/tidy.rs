@@ -302,6 +302,7 @@ pub fn check(root: &Path) -> std::io::Result<Vec<String>> {
     problems.extend(waits(root)?);
     problems.extend(mutexes(root)?);
     problems.extend(opens(root)?);
+    problems.extend(crate::tidy_switches::check(root)?);
     let base = djs_base::make();
     let base_dir = root.join(BASE_DIR);
     for file in djs_base::stale(&base_dir, &base) {
@@ -735,7 +736,7 @@ fn held_sources(root: &Path, directory: &Path, found: &mut Vec<(String, String)>
     rust_sources(root, directory, HELD_SKIPPED, HELD_SKIPPED_DIRS, found)
 }
 
-fn rust_sources(
+pub(crate) fn rust_sources(
     root: &Path,
     directory: &Path,
     skipped_paths: &[&str],

@@ -5,6 +5,7 @@ mod route;
 mod scopes;
 pub mod sim;
 mod sql;
+pub mod switches;
 
 use std::sync::Arc;
 

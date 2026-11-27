@@ -1,26 +1,31 @@
 use std::{
     future::Future,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use nanocode_scope::ScopeError;
 use nanocode_sync::Atom;
 use nanocode_tool_host::{
     ToolOutput,
+    code_mode::CellJournalSink,
     effects::{Carried, EffectCall, EffectGate, RemoteBarrier},
     embedded::HostFuture,
     hold::{HoldCall, HoldLedger, LedgerError, Running},
 };
-use nanocode_turnlog::{Answer, ArmedWake, EffectClass, Resumption, Wake, WakeRider};
+use nanocode_turnlog::{Answer, ArmedWake, EffectClass, Point, Resumption, Wake, WakeRider};
 use serde_json::{Map, Value, value::RawValue};
 
 use super::{Exported, Fire, Heard, Imported, OneLog, Policy, WakeError};
 use crate::{
-    durability::{StoreError, StoreRecord},
+    durability::{StateStore, StoreError, StoreRecord},
     session_log::{LogEntry, LoggedEvent, Started, Submission, Submitted, TurnRecord, TurnState},
     thread_scope::{
-        HoldsError, ThreadBinding, ThreadHolds, ThreadJournals, ThreadLog, ThreadLogs, ThreadState,
-        ThreadStore, ThreadTurns, ThreadWakes, sim, wakes,
+        HoldsError, ThreadBinding, ThreadCommand, ThreadHolds, ThreadJournals, ThreadLog,
+        ThreadLogs, ThreadPath, ThreadState, ThreadStore, ThreadTurns, ThreadWakes, legacy_refused,
+        sim, wakes,
     },
 };
 
@@ -29,11 +34,14 @@ type Answered = Option<(TurnRecord, Option<LoggedEvent>)>;
 pub struct OneLogOver {
     logs: Arc<ThreadLogs>,
     thread: String,
+    policy: Policy,
     binding: Arc<ThreadBinding>,
-    bound: Atom<Arc<Bound>>,
+    serving: Atom<Serving>,
     store: ThreadStore,
     journals: ThreadJournals,
     index: Atom<Option<Arc<dyn WakeRider>>>,
+    durable: AtomicBool,
+    deferred: AtomicBool,
     this: Weak<Self>,
 }
 
@@ -42,6 +50,42 @@ struct Bound {
     turns: ThreadTurns,
     holds: ThreadHolds,
     wakes: ThreadWakes,
+}
+
+struct Old {
+    log: Arc<OneLog>,
+    resident: Arc<Bound>,
+    uncertain: Vec<String>,
+}
+
+#[derive(Clone)]
+enum Serving {
+    Resident(Arc<Bound>),
+    Legacy(Arc<Old>),
+}
+
+impl Serving {
+    const fn path(&self) -> ThreadPath {
+        match self {
+            Self::Resident(_) => ThreadPath::Resident,
+            Self::Legacy(_) => ThreadPath::Legacy,
+        }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Resident(one), Self::Resident(two)) => Arc::ptr_eq(one, two),
+            (Self::Legacy(one), Self::Legacy(two)) => Arc::ptr_eq(one, two),
+            (Self::Resident(_) | Self::Legacy(_), _) => false,
+        }
+    }
+
+    fn resident(&self) -> &Arc<Bound> {
+        match self {
+            Self::Resident(bound) => bound,
+            Self::Legacy(old) => &old.resident,
+        }
+    }
 }
 
 trait Refusal: Sized {
@@ -80,6 +124,16 @@ impl Refusal for HoldsError {
     }
 }
 
+impl Refusal for String {
+    fn lost(&self) -> bool {
+        false
+    }
+
+    fn of(error: StoreError) -> Self {
+        error.to_string()
+    }
+}
+
 fn refused(error: ScopeError) -> StoreError {
     match error {
         ScopeError::Store(error) => error,
@@ -97,13 +151,35 @@ fn local(log: &ThreadLog) -> Result<Arc<ThreadState>, StoreError> {
     })
 }
 
+fn legacy_read(thread: &str) -> StoreError {
+    StoreError::NotCommitted(legacy_refused(thread))
+}
+
+async fn handed_over(log: &OneLog) -> Result<(), StoreError> {
+    log.log
+        .write_within(|writing| {
+            Box::pin(async move {
+                if writing.buffered() > 0 {
+                    writing.commit(Point::Progress).await?;
+                } else {
+                    writing.unride();
+                }
+                Ok::<_, StoreError>(())
+            })
+        })
+        .await?;
+    log.owed.set(false);
+    assert!(!*log.owed.get(), "a handed over writer owes no settle");
+    Ok(())
+}
+
 impl OneLog {
     pub async fn over(
         logs: Arc<ThreadLogs>,
         thread: &str,
         policy: &Policy,
     ) -> Result<Arc<OneLogOver>, StoreError> {
-        let log = Arc::new(logs.get(thread).await.map_err(refused)?);
+        let log = Arc::new(logs.reach(thread).await.map_err(refused)?);
         let binding = Arc::new(ThreadBinding::new(
             Arc::clone(&logs),
             thread,
@@ -121,13 +197,52 @@ impl OneLog {
         Ok(Arc::new_cyclic(|this| OneLogOver {
             logs,
             thread: thread.to_owned(),
+            policy: policy.clone(),
             binding,
-            bound: Atom::new(Arc::new(bound)),
+            serving: Atom::new(Serving::Resident(Arc::new(bound))),
             store,
             journals,
             index: Atom::new(None),
+            durable: AtomicBool::new(false),
+            deferred: AtomicBool::new(false),
             this: Weak::clone(this),
         }))
+    }
+}
+
+enum Gated<L> {
+    Resident(HoldsError),
+    Legacy(L),
+}
+
+impl<L> Refusal for Gated<L> {
+    fn lost(&self) -> bool {
+        match self {
+            Self::Resident(error) => error.lost(),
+            Self::Legacy(_) => false,
+        }
+    }
+
+    fn of(error: StoreError) -> Self {
+        Self::Resident(HoldsError::of(error))
+    }
+}
+
+impl Gated<String> {
+    fn said(self) -> String {
+        match self {
+            Self::Resident(error) => error.said(),
+            Self::Legacy(said) => said,
+        }
+    }
+}
+
+impl Gated<LedgerError> {
+    fn ledger(self) -> LedgerError {
+        match self {
+            Self::Resident(error) => error.ledger(),
+            Self::Legacy(error) => error,
+        }
     }
 }
 
@@ -137,17 +252,99 @@ impl OneLogOver {
         &self.thread
     }
 
-    fn current(&self) -> Arc<Bound> {
-        self.bound.read(Arc::clone)
+    #[must_use]
+    pub fn path(&self) -> ThreadPath {
+        self.current().path()
     }
 
-    async fn fresh(&self) -> Result<Arc<Bound>, StoreError> {
-        let bound = self.current();
-        let log = self.binding.log();
-        if Arc::ptr_eq(&bound.log, &log) {
-            return Ok(bound);
+    fn current(&self) -> Serving {
+        self.serving.read(Clone::clone)
+    }
+
+    fn settled(&self, stale: &Serving, fresh: Serving) -> Serving {
+        self.serving.update(|serving| {
+            if serving.same(stale) {
+                *serving = fresh.clone();
+            }
+            serving.clone()
+        })
+    }
+
+    async fn fresh(&self) -> Result<Serving, StoreError> {
+        let serving = self.current();
+        let fresh = match (&serving, self.logs.path(&self.thread)) {
+            (Serving::Legacy(_), ThreadPath::Legacy) => return Ok(serving),
+            (Serving::Resident(bound), ThreadPath::Resident) => {
+                let log = self.binding.log();
+                if Arc::ptr_eq(&bound.log, &log) {
+                    return Ok(serving);
+                }
+                Serving::Resident(self.bind(bound, log).await?)
+            }
+            (Serving::Resident(bound), ThreadPath::Legacy) => {
+                Serving::Legacy(self.old(bound).await?)
+            }
+            (Serving::Legacy(old), ThreadPath::Resident) => {
+                Serving::Resident(self.adopted(old).await?)
+            }
+        };
+        if fresh.path() != serving.path() {
+            self.logs.flipped();
         }
-        self.bind(&bound, log).await
+        Ok(self.settled(&serving, fresh))
+    }
+
+    async fn old(&self, resident: &Arc<Bound>) -> Result<Arc<Old>, StoreError> {
+        let mut reached = self.logs.reach(&self.thread).await.map_err(refused)?;
+        if reached.state().is_none()
+            && let Err(ScopeError::Unreachable { .. }) = reached.send(ThreadCommand::Pending).await
+        {
+            reached = self.logs.reach(&self.thread).await.map_err(refused)?;
+        }
+        local(&reached)?;
+        match self.logs.scopes().drain(&self.thread).await {
+            Ok(_) | Err(ScopeError::Moved) => {}
+            Err(error) => return Err(refused(error)),
+        }
+        drop(reached);
+        let mut policy = self.policy.clone();
+        policy.effects = resident.holds.effects().read(Clone::clone);
+        let log = OneLog::open(self.logs.host(), self.thread.as_str(), policy).await?;
+        if self.durable.load(Ordering::Relaxed) {
+            log.settle_durably();
+        }
+        if self.deferred.load(Ordering::Relaxed) {
+            log.deferred_settles.set(true);
+        }
+        if let Some(index) = self.index.read(Clone::clone) {
+            log.index_wakes(index).await?;
+        }
+        let uncertain = log.uncertain_holds().await;
+        Ok(Arc::new(Old {
+            log,
+            resident: Arc::clone(resident),
+            uncertain,
+        }))
+    }
+
+    async fn adopted(&self, old: &Old) -> Result<Arc<Bound>, StoreError> {
+        handed_over(&old.log).await?;
+        let mut log = self.binding.log();
+        if log.retired() || Arc::ptr_eq(&log, &old.resident.log) {
+            log = self.binding.rebound(&log).await.map_err(refused)?;
+        }
+        self.bind(&old.resident, log).await
+    }
+
+    async fn again(&self, stale: &Serving) -> Result<Serving, StoreError> {
+        if self.logs.path(&self.thread) != stale.path() {
+            return self.fresh().await;
+        }
+        let fresh = match stale {
+            Serving::Resident(bound) => Serving::Resident(self.rebound(bound).await?),
+            Serving::Legacy(old) => Serving::Legacy(self.old(&old.resident).await?),
+        };
+        Ok(self.settled(stale, fresh))
     }
 
     async fn rebound(&self, stale: &Bound) -> Result<Arc<Bound>, StoreError> {
@@ -165,21 +362,20 @@ impl OneLogOver {
         if let Some(index) = self.index.read(Clone::clone) {
             bound.wakes.index_wakes(index).await?;
         }
-        self.bound.set(Arc::clone(&bound));
         Ok(bound)
     }
 
     async fn retried<T, E, F, Fut>(&self, command: F) -> Result<T, E>
     where
         E: Refusal,
-        F: Fn(Arc<Bound>) -> Fut,
+        F: Fn(Serving) -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        let bound = self.fresh().await.map_err(E::of)?;
-        match command(Arc::clone(&bound)).await {
+        let serving = self.fresh().await.map_err(E::of)?;
+        match command(serving.clone()).await {
             Err(error) if error.lost() && !sim::mutated(sim::Mutation::LostUnretried) => {
-                let bound = self.rebound(&bound).await.map_err(E::of)?;
-                command(bound).await
+                let serving = self.again(&serving).await.map_err(E::of)?;
+                command(serving).await
             }
             answered => answered,
         }
@@ -190,46 +386,85 @@ impl OneLogOver {
     }
 
     pub async fn read<R>(&self, read: impl FnOnce(&ThreadState) -> R) -> Result<R, StoreError> {
-        Ok(read(&*self.published().await?))
+        match self.fresh().await? {
+            Serving::Resident(_) => Ok(read(&*self.published().await?)),
+            Serving::Legacy(_) => Err(legacy_read(&self.thread)),
+        }
     }
 
     #[must_use]
     pub fn remembered_bytes(&self) -> usize {
-        self.current().log.state().map_or(0, |state| state.weighed())
+        match self.current() {
+            Serving::Resident(bound) => bound.log.state().map_or(0, |state| state.weighed()),
+            Serving::Legacy(old) => old.log.remembered_bytes(),
+        }
     }
 
     pub async fn reclaim(&self) -> Result<(), StoreError> {
-        self.published().await.map(drop)
+        match self.fresh().await? {
+            Serving::Resident(_) => self.published().await.map(drop),
+            Serving::Legacy(old) => old.log.reclaim().await,
+        }
     }
 
     pub async fn submit(&self, submission: &Submission) -> Result<Submitted, StoreError> {
-        self.retried(|bound| async move { bound.turns.submit(submission).await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.turns.submit(submission).await,
+                Serving::Legacy(old) => old.log.submit(submission).await,
+            }
+        })
+        .await
     }
 
     pub async fn submit_buffered(&self, submission: &Submission) -> Result<Submitted, StoreError> {
-        self.retried(|bound| async move { bound.turns.submit_buffered(submission).await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.turns.submit_buffered(submission).await,
+                Serving::Legacy(old) => old.log.submit_buffered(submission).await,
+            }
+        })
+        .await
     }
 
     pub async fn append(&self, entries: &[LogEntry]) -> Result<Vec<LoggedEvent>, StoreError> {
-        self.retried(|bound| async move { bound.turns.append(entries).await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.turns.append(entries).await,
+                Serving::Legacy(old) => old.log.append(entries).await,
+            }
+        })
+        .await
     }
 
     pub async fn turn(&self, request_id: &str) -> Result<Option<TurnRecord>, StoreError> {
-        self.retried(|bound| async move { bound.turns.turn(request_id).await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.turns.turn(request_id).await,
+                Serving::Legacy(old) => old.log.turn(request_id).await,
+            }
+        })
+        .await
     }
 
     pub async fn pending(&self) -> Result<Vec<TurnRecord>, StoreError> {
-        self.retried(|bound| async move { bound.turns.pending().await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.turns.pending().await,
+                Serving::Legacy(old) => old.log.pending().await,
+            }
+        })
+        .await
     }
 
     pub async fn start(&self, request_id: &str) -> Result<Option<Started>, StoreError> {
-        self.retried(|bound| async move { bound.turns.start(request_id).await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.turns.start(request_id).await,
+                Serving::Legacy(old) => old.log.start(request_id).await,
+            }
+        })
+        .await
     }
 
     pub async fn finish(
@@ -238,8 +473,13 @@ impl OneLogOver {
         state: TurnState,
         fields: &Map<String, Value>,
     ) -> Result<Option<(TurnRecord, LoggedEvent)>, StoreError> {
-        self.retried(|bound| async move { bound.turns.finish(request_id, state, fields).await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.turns.finish(request_id, state, fields).await,
+                Serving::Legacy(old) => old.log.finish(request_id, state, fields).await,
+            }
+        })
+        .await
     }
 
     pub async fn cancel(
@@ -247,8 +487,13 @@ impl OneLogOver {
         request_id: &str,
         fields: &Map<String, Value>,
     ) -> Result<Answered, StoreError> {
-        self.retried(|bound| async move { bound.turns.cancel(request_id, fields).await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.turns.cancel(request_id, fields).await,
+                Serving::Legacy(old) => old.log.cancel(request_id, fields).await,
+            }
+        })
+        .await
     }
 
     pub async fn withdraw_steered(
@@ -256,13 +501,23 @@ impl OneLogOver {
         request_id: &str,
         digest: &str,
     ) -> Result<Option<(TurnRecord, LoggedEvent)>, StoreError> {
-        self.retried(|bound| async move { bound.turns.withdraw_steered(request_id, digest).await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.turns.withdraw_steered(request_id, digest).await,
+                Serving::Legacy(old) => old.log.withdraw_steered(request_id, digest).await,
+            }
+        })
+        .await
     }
 
     pub async fn interrupted(&self, request_id: &str, note: &str) -> Result<(), StoreError> {
-        self.retried(|bound| async move { bound.turns.interrupted(request_id, note).await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.turns.interrupted(request_id, note).await,
+                Serving::Legacy(old) => old.log.interrupted(request_id, note).await,
+            }
+        })
+        .await
     }
 
     pub async fn retry(
@@ -272,8 +527,13 @@ impl OneLogOver {
         kind: &str,
         retry_at: u64,
     ) -> Result<Answered, StoreError> {
-        self.retried(|bound| async move {
-            bound.turns.retry(request_id, error, kind, retry_at).await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => {
+                    bound.turns.retry(request_id, error, kind, retry_at).await
+                }
+                Serving::Legacy(old) => old.log.retry(request_id, error, kind, retry_at).await,
+            }
         })
         .await
     }
@@ -288,8 +548,26 @@ impl OneLogOver {
         self.journals.clone()
     }
 
+    pub async fn states(&self) -> Result<Box<dyn StateStore>, StoreError> {
+        Ok(match self.fresh().await? {
+            Serving::Resident(_) => Box::new(self.store.clone()),
+            Serving::Legacy(old) => Box::new(old.log.store()),
+        })
+    }
+
+    pub async fn sink(&self) -> Result<Arc<dyn CellJournalSink>, StoreError> {
+        Ok(match self.fresh().await? {
+            Serving::Resident(_) => self.journals.sink(),
+            Serving::Legacy(old) => old.log.sink(),
+        })
+    }
+
     pub fn settle_durably(&self) {
+        self.durable.store(true, Ordering::Relaxed);
         self.store.settle_durably();
+        if let Serving::Legacy(old) = self.current() {
+            old.log.settle_durably();
+        }
     }
 
     pub async fn import_state(
@@ -299,27 +577,57 @@ impl OneLogOver {
         payload: &str,
         records: &[StoreRecord],
     ) -> Result<Imported, StoreError> {
-        self.store
-            .import_state(state_id, revision, payload, records)
-            .await
+        match self.fresh().await? {
+            Serving::Resident(_) => {
+                self.store
+                    .import_state(state_id, revision, payload, records)
+                    .await
+            }
+            Serving::Legacy(old) => {
+                old.log
+                    .import_state(state_id, revision, payload, records)
+                    .await
+            }
+        }
     }
 
     pub async fn export_state(&self, state_id: &str) -> Result<Option<Exported>, StoreError> {
-        self.store.export_state(state_id).await
+        match self.fresh().await? {
+            Serving::Resident(_) => self.store.export_state(state_id).await,
+            Serving::Legacy(old) => old.log.export_state(state_id).await,
+        }
     }
 
     pub fn declare(&self, tool: impl Into<String>, class: EffectClass) {
-        self.current().holds.declare(tool, class);
+        let tool = tool.into();
+        let serving = self.current();
+        serving.resident().holds.declare(tool.clone(), class);
+        if let Serving::Legacy(old) = serving {
+            old.log.declare(tool, class);
+        }
     }
 
     #[must_use]
     pub fn effect_of(&self, tool: &str) -> EffectClass {
-        self.current().holds.effect_of(tool)
+        match self.current() {
+            Serving::Resident(bound) => bound.holds.effect_of(tool),
+            Serving::Legacy(old) => old.log.effect_of(tool),
+        }
     }
 
     #[must_use]
     pub fn uncertain_holds(&self) -> Vec<String> {
-        self.current().holds.uncertain_holds()
+        match self.current() {
+            Serving::Resident(bound) => bound.holds.uncertain_holds(),
+            Serving::Legacy(old) => {
+                let resolved = old.log.resolved.get();
+                old.uncertain
+                    .iter()
+                    .filter(|key| !resolved.contains(*key))
+                    .cloned()
+                    .collect()
+            }
+        }
     }
 
     fn this(&self) -> Arc<Self> {
@@ -340,29 +648,48 @@ impl OneLogOver {
 
     #[must_use]
     pub fn barrier(&self) -> Arc<dyn RemoteBarrier> {
+        self.deferred.store(true, Ordering::Relaxed);
+        if let Serving::Legacy(old) = self.current() {
+            old.log.deferred_settles.set(true);
+        }
         self.this()
     }
 
     pub async fn index_wakes(&self, index: Arc<dyn WakeRider>) -> Result<(), StoreError> {
         self.index.set(Some(Arc::clone(&index)));
-        self.retried(|bound| {
+        self.retried(|serving| {
             let index = Arc::clone(&index);
-            async move { bound.wakes.index_wakes(index).await }
+            async move {
+                match serving {
+                    Serving::Resident(bound) => bound.wakes.index_wakes(index).await,
+                    Serving::Legacy(old) => old.log.index_wakes(index).await,
+                }
+            }
         })
         .await
     }
 
     pub async fn arm(&self, key: &str, wake: Wake) -> Result<u64, WakeError> {
-        self.retried(|bound| {
+        self.retried(|serving| {
             let wake = wake.clone();
-            async move { bound.wakes.arm(key, wake).await }
+            async move {
+                match serving {
+                    Serving::Resident(bound) => bound.wakes.arm(key, wake).await,
+                    Serving::Legacy(old) => old.log.arm(key, wake).await,
+                }
+            }
         })
         .await
     }
 
     pub async fn disarm(&self, key: &str) -> Result<Option<u64>, StoreError> {
-        self.retried(|bound| async move { bound.wakes.disarm(key).await })
-            .await
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.wakes.disarm(key).await,
+                Serving::Legacy(old) => old.log.disarm(key).await,
+            }
+        })
+        .await
     }
 
     pub async fn hear(
@@ -371,9 +698,14 @@ impl OneLogOver {
         fields: &Map<String, Value>,
         event: Box<RawValue>,
     ) -> Result<Heard, StoreError> {
-        self.retried(|bound| {
+        self.retried(|serving| {
             let event = event.clone();
-            async move { bound.wakes.hear(topic, fields, event).await }
+            async move {
+                match serving {
+                    Serving::Resident(bound) => bound.wakes.hear(topic, fields, event).await,
+                    Serving::Legacy(old) => old.log.hear(topic, fields, event).await,
+                }
+            }
         })
         .await
     }
@@ -386,28 +718,46 @@ impl OneLogOver {
         submission: &Submission,
         next: Option<Wake>,
     ) -> Result<Fire, WakeError> {
-        self.retried(|bound| {
+        self.retried(|serving| {
             let next = next.clone();
             async move {
-                bound
-                    .wakes
-                    .fire(key, generation, now_ms, submission, next)
-                    .await
+                match serving {
+                    Serving::Resident(bound) => {
+                        bound
+                            .wakes
+                            .fire(key, generation, now_ms, submission, next)
+                            .await
+                    }
+                    Serving::Legacy(old) => {
+                        old.log
+                            .fire(key, generation, now_ms, submission, next)
+                            .await
+                    }
+                }
             }
         })
         .await
     }
 
     pub async fn wake(&self, key: &str) -> Result<Option<ArmedWake>, StoreError> {
-        self.read(|state| wakes::armed_at(state, key)).await
+        match self.fresh().await? {
+            Serving::Resident(_) => self.read(|state| wakes::armed_at(state, key)).await,
+            Serving::Legacy(old) => Ok(old.log.wake(key).await),
+        }
     }
 
     pub async fn due_wakes(&self, now_ms: u64) -> Result<Vec<(String, ArmedWake)>, StoreError> {
-        self.read(|state| wakes::due(state, now_ms)).await
+        match self.fresh().await? {
+            Serving::Resident(_) => self.read(|state| wakes::due(state, now_ms)).await,
+            Serving::Legacy(old) => Ok(old.log.due_wakes(now_ms).await),
+        }
     }
 
     pub async fn next_due(&self) -> Result<Option<u64>, StoreError> {
-        self.read(|state| wakes::summary(state).next_due).await
+        match self.fresh().await? {
+            Serving::Resident(_) => self.read(|state| wakes::summary(state).next_due).await,
+            Serving::Legacy(old) => Ok(old.log.next_due().await),
+        }
     }
 }
 
@@ -426,7 +776,7 @@ impl EffectGate for OneLogOver {
             turn_id,
         } = call;
         Box::pin(async move {
-            self.retried(move |bound| async move {
+            self.retried(move |serving| async move {
                 let call = EffectCall {
                     call_id,
                     effect,
@@ -435,19 +785,22 @@ impl EffectGate for OneLogOver {
                     tool,
                     turn_id,
                 };
-                bound.holds.before_call(call).await
+                match serving {
+                    Serving::Resident(bound) => {
+                        bound.holds.before_call(call).await.map_err(Gated::Resident)
+                    }
+                    Serving::Legacy(old) => EffectGate::before(&*old.log, call)
+                        .await
+                        .map_err(Gated::Legacy),
+                }
             })
             .await
-            .map_err(HoldsError::said)
+            .map_err(Gated::said)
         })
     }
 
     fn settle(&self) -> HostFuture<'_, Result<(), String>> {
-        Box::pin(async move {
-            self.retried(|bound| async move { bound.holds.settled().await })
-                .await
-                .map_err(HoldsError::said)
-        })
+        Box::pin(async move { self.settled_holds().await })
     }
 
     fn abandon<'a>(
@@ -455,14 +808,43 @@ impl EffectGate for OneLogOver {
         call_id: &'a str,
     ) -> HostFuture<'a, Result<Option<ToolOutput>, String>> {
         Box::pin(async move {
-            self.retried(move |bound| async move { bound.holds.abandon_call(call_id).await })
-                .await
-                .map_err(HoldsError::said)
+            self.retried(move |serving| async move {
+                match serving {
+                    Serving::Resident(bound) => bound
+                        .holds
+                        .abandon_call(call_id)
+                        .await
+                        .map_err(Gated::Resident),
+                    Serving::Legacy(old) => EffectGate::abandon(&*old.log, call_id)
+                        .await
+                        .map_err(Gated::Legacy),
+                }
+            })
+            .await
+            .map_err(Gated::said)
         })
     }
 
     fn after<'a>(&'a self, call_id: &'a str, output: &'a ToolOutput) -> HostFuture<'a, ()> {
-        Box::pin(async move { self.current().holds.after(call_id, output).await })
+        Box::pin(async move {
+            match self.current() {
+                Serving::Resident(bound) => bound.holds.after(call_id, output).await,
+                Serving::Legacy(old) => EffectGate::after(&*old.log, call_id, output).await,
+            }
+        })
+    }
+}
+
+impl OneLogOver {
+    async fn settled_holds(&self) -> Result<(), String> {
+        self.retried(|serving| async move {
+            match serving {
+                Serving::Resident(bound) => bound.holds.settled().await.map_err(Gated::Resident),
+                Serving::Legacy(old) => EffectGate::settle(&*old.log).await.map_err(Gated::Legacy),
+            }
+        })
+        .await
+        .map_err(Gated::said)
     }
 }
 
@@ -481,7 +863,7 @@ impl HoldLedger for OneLogOver {
             turn_id,
         } = call;
         Box::pin(async move {
-            self.retried(move |bound| async move {
+            self.retried(move |serving| async move {
                 let call = HoldCall {
                     call_id,
                     input,
@@ -489,10 +871,19 @@ impl HoldLedger for OneLogOver {
                     tool,
                     turn_id,
                 };
-                bound.holds.hold_call(key, call, card).await
+                match serving {
+                    Serving::Resident(bound) => bound
+                        .holds
+                        .hold_call(key, call, card)
+                        .await
+                        .map_err(Gated::Resident),
+                    Serving::Legacy(old) => HoldLedger::hold(&*old.log, key, call, card)
+                        .await
+                        .map_err(Gated::Legacy),
+                }
             })
             .await
-            .map_err(HoldsError::ledger)
+            .map_err(Gated::ledger)
         })
     }
 
@@ -502,28 +893,58 @@ impl HoldLedger for OneLogOver {
         answer: Answer,
     ) -> HostFuture<'a, Result<Resumption, LedgerError>> {
         Box::pin(async move {
-            self.retried(move |bound| {
+            self.retried(move |serving| {
                 let answer = answer.clone();
-                async move { bound.holds.resolve_hold(key, answer).await }
+                async move {
+                    match serving {
+                        Serving::Resident(bound) => bound
+                            .holds
+                            .resolve_hold(key, answer)
+                            .await
+                            .map_err(Gated::Resident),
+                        Serving::Legacy(old) => HoldLedger::resolve(&*old.log, key, answer)
+                            .await
+                            .map_err(Gated::Legacy),
+                    }
+                }
             })
             .await
-            .map_err(HoldsError::ledger)
+            .map_err(Gated::ledger)
         })
     }
 
     fn running<'a>(&'a self, call_id: &'a str) -> HostFuture<'a, Option<Running>> {
-        Box::pin(async move { self.current().holds.running(call_id).await })
+        Box::pin(async move {
+            match self.current() {
+                Serving::Resident(bound) => bound.holds.running(call_id).await,
+                Serving::Legacy(old) => HoldLedger::running(&*old.log, call_id).await,
+            }
+        })
     }
 
     fn claim<'a>(&'a self, key: &'a str) -> HostFuture<'a, bool> {
-        Box::pin(async move { self.current().holds.claim(key).await })
+        Box::pin(async move {
+            match self.current() {
+                Serving::Resident(bound) => bound.holds.claim(key).await,
+                Serving::Legacy(old) => HoldLedger::claim(&*old.log, key).await,
+            }
+        })
     }
 
     fn release<'a>(&'a self, key: &'a str) -> HostFuture<'a, Result<(), LedgerError>> {
         Box::pin(async move {
-            self.retried(move |bound| async move { bound.holds.release_hold(key).await })
-                .await
-                .map_err(HoldsError::ledger)
+            self.retried(move |serving| async move {
+                match serving {
+                    Serving::Resident(bound) => {
+                        bound.holds.release_hold(key).await.map_err(Gated::Resident)
+                    }
+                    Serving::Legacy(old) => HoldLedger::release(&*old.log, key)
+                        .await
+                        .map_err(Gated::Legacy),
+                }
+            })
+            .await
+            .map_err(Gated::ledger)
         })
     }
 }
@@ -531,13 +952,19 @@ impl HoldLedger for OneLogOver {
 impl RemoteBarrier for OneLogOver {
     fn settle(&self) -> HostFuture<'_, Result<(), String>> {
         Box::pin(async move {
-            self.retried(|bound| async move { bound.holds.settled().await })
-                .await
-                .map_err(HoldsError::said)
+            match self.current() {
+                Serving::Legacy(old) => RemoteBarrier::settle(&*old.log).await,
+                Serving::Resident(_) => self.settled_holds().await,
+            }
         })
     }
 
     fn carry(&self, carried: Carried) -> HostFuture<'_, Result<bool, String>> {
-        Box::pin(async move { self.current().holds.carry(carried).await })
+        Box::pin(async move {
+            match self.current() {
+                Serving::Resident(bound) => bound.holds.carry(carried).await,
+                Serving::Legacy(old) => RemoteBarrier::carry(&*old.log, carried).await,
+            }
+        })
     }
 }
