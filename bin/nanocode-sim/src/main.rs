@@ -56,6 +56,7 @@ mod threadjournals;
 mod threadscope;
 mod threadholds;
 mod threadstore;
+mod threadtail;
 mod threadturns;
 mod threadcompat;
 mod threadimport;

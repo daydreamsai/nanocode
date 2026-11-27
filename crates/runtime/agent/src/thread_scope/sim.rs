@@ -29,10 +29,11 @@ pub enum Mutation {
     ScopeWritesUntagged,
     ScopeStartsAtRowZero,
     FlipOffUnreadable,
+    TailUnbounded,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::PartDropped,
         Self::AdoptionSkipsRetired,
         Self::AdoptionSkipsBlobs,
@@ -57,6 +58,7 @@ impl Mutation {
         Self::JournalLostUnretried,
         Self::ScopeWritesUntagged,
         Self::ScopeStartsAtRowZero,
+        Self::TailUnbounded,
     ];
 
     #[must_use]
@@ -88,6 +90,7 @@ impl Mutation {
             Self::ScopeWritesUntagged => "scope_writes_untagged",
             Self::ScopeStartsAtRowZero => "scope_starts_at_row_zero",
             Self::FlipOffUnreadable => "flip_off_unreadable",
+            Self::TailUnbounded => "tail_unbounded",
         }
     }
 

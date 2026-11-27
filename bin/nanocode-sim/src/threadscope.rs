@@ -1606,6 +1606,13 @@ fn seeded(seed: u64, mutation: ThreadScopeMutation, time: &Arc<Clock>) -> Outcom
             flag(&world.wrong, wrong);
         }
     }
+    if world.wrong.read(Option::is_none) {
+        let tail = self::world(&mut rng, time);
+        crate::threadtail::run(&mut rng, &tail);
+        if let Some(wrong) = tail.wrong.read(Clone::clone) {
+            flag(&world.wrong, wrong);
+        }
+    }
     thread_scope_sim::mutate(Mutation::None);
     scope_sim::mutate(ScopeMutation::None);
     nanocode_turnlog::sim::mutate(TurnLogMutation::None);

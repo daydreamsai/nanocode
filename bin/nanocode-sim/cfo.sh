@@ -513,6 +513,7 @@ default_table='
 1 canary_thread_scope_reimport_advances canary:16 --scenario thread_scope --mutation reimport_advances
 1 canary_thread_scope_store_skips_fence canary:16 --scenario thread_scope --mutation store_skips_fence
 1 canary_thread_scope_journal_loads_finished canary:16 --scenario thread_scope --mutation journal_loads_finished
+1 canary_thread_scope_tail_unbounded canary:16 --scenario thread_scope --mutation tail_unbounded
 4 flips pass --scenario flips
 1 flips_twice pass --scenario flips --twice
 1 canary_flips_flip_off_unreadable canary:16 --scenario flips --mutation flip_off_unreadable

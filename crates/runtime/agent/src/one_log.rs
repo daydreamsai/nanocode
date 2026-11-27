@@ -540,7 +540,11 @@ impl OneLog {
             .retain_finished(policy.retain_finished)
             .host_calls_within(policy.host_call_bound)
             .row_limit(policy.max_row_bytes)
-            .max_tail_bytes(policy.max_tail_bytes)
+            .max_tail_bytes(if thread_scope_sim::mutated(thread_scope_sim::Mutation::TailUnbounded) {
+                None
+            } else {
+                policy.max_tail_bytes
+            })
             .chain_bytes_max(policy.chain_bytes_max)
             .snapshot_ratio(policy.snapshot_ratio)
             .snapshot_rows(policy.snapshot_rows);
@@ -2702,6 +2706,3 @@ impl StateStore for OneLogStore {
     }
 }
 
-#[cfg(test)]
-#[path = "one_log_tail_tests.rs"]
-mod tail_tests;
