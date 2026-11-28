@@ -54,6 +54,7 @@ const XGATE: &str = "https://api.xgate.run";
 const XGATE_OPERATION: &str = "messages";
 const PAYMENT_SCHEME: &str = "payment ";
 const SHOULD_RETRY: &str = "x-should-retry";
+const PAID_RESPONSE_BYTES_MAX: usize = 32 * 1024 * 1024;
 const TEMPO_SERVICES: &str = "*.mpp.tempo.xyz";
 const OWN_PROXY_SETTINGS: [&str; 10] = [
     "HTTP_PROXY",
@@ -195,6 +196,10 @@ impl Layer for Mpp {
                 .exchange
                 .body
                 .ok_or_else(|| layer::Error::new("the payment flow returned no response"))?;
+            let body = match decided {
+                true => buffered(body).await?,
+                false => body,
+            };
             let mut headers = response.headers().clone();
             if decided && !response.status().is_success() {
                 headers.insert(
@@ -212,6 +217,25 @@ impl Layer for Mpp {
             )
         })
     }
+}
+
+async fn buffered(mut body: layer::Body) -> std::result::Result<layer::Body, layer::Error> {
+    use nanocode_sync::stream::StreamExt as _;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|error| {
+            layer::Error::new(format!("the paid response broke while reading: {error}"))
+        })?;
+        if bytes.len() + chunk.len() > PAID_RESPONSE_BYTES_MAX {
+            return Err(layer::Error::new(format!(
+                "the paid response exceeds {PAID_RESPONSE_BYTES_MAX} bytes"
+            )));
+        }
+        bytes.extend(chunk);
+    }
+    Ok(Box::pin(nanocode_sync::stream::once(
+        async move { Ok(bytes) },
+    )))
 }
 
 struct StreamPayments {
