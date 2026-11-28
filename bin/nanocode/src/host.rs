@@ -761,7 +761,7 @@ impl Host {
             }
         };
         let (xgate, xgate_limits) = match &config.clients.tempo {
-            Some(tempo) => (Some(tempo.xgate()), Some(tempo.xgate_limits())),
+            Some(tempo) => (Some(tempo.xgate()), Some(tempo.xgate_limits(config.hedge))),
             None => (None, None),
         };
         let (tempo_openai, tempo_claude, boundless) = match &config.clients.tempo {

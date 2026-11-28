@@ -52,6 +52,9 @@ const TEMPO_GATEWAY: &str = "https://gateway.tempo-dev.workers.dev";
 const BOUNDLESS: &str = "https://api.inference.boundless.network/mpp/v1";
 const XGATE: &str = "https://api.xgate.run";
 const XGATE_OPERATION: &str = "messages";
+const PAYMENT_SCHEME: &str = "payment ";
+const SHOULD_RETRY: &str = "x-should-retry";
+const PAID_RESPONSE_BYTES_MAX: usize = 32 * 1024 * 1024;
 const TEMPO_SERVICES: &str = "*.mpp.tempo.xyz";
 const OWN_PROXY_SETTINGS: [&str; 10] = [
     "HTTP_PROXY",
@@ -86,6 +89,7 @@ struct Mpp {
     probe: (String, Option<&'static str>),
     warm: Arc<Warm>,
     identity: Option<Arc<Identity>>,
+    per_purchase: bool,
 }
 
 #[derive(Default)]
@@ -101,6 +105,14 @@ impl Mpp {
             probe,
             warm: Arc::default(),
             identity: None,
+            per_purchase: false,
+        }
+    }
+
+    fn per_purchase(self) -> Self {
+        Self {
+            per_purchase: true,
+            ..self
         }
     }
 
@@ -161,6 +173,7 @@ impl Layer for Mpp {
                         .client()
                         .map_err(|error| layer::Error::new(error).unsent(true))?,
                     body: None,
+                    paid: false,
                 },
                 identity: self.identity.as_deref(),
             };
@@ -172,8 +185,10 @@ impl Layer for Mpp {
                 &self.wallet.payments.events,
                 DEFAULT_MAX_PAYMENT_RETRIES,
             )
-            .await
-            .map_err(|error| match error {
+            .await;
+            let decided = self.per_purchase && exchange.exchange.paid;
+            let response = response.map_err(|error| match error {
+                FlowError::Send(error) if decided => error.retryable(false).timeout(false),
                 FlowError::Send(error) => error,
                 FlowError::Payment(error) => layer::Error::new(error.to_string()),
             })?;
@@ -181,15 +196,46 @@ impl Layer for Mpp {
                 .exchange
                 .body
                 .ok_or_else(|| layer::Error::new("the payment flow returned no response"))?;
+            let body = match decided {
+                true => buffered(body).await?,
+                false => body,
+            };
+            let mut headers = response.headers().clone();
+            if decided && !response.status().is_success() {
+                headers.insert(
+                    SHOULD_RETRY,
+                    nanocode_http::types::HeaderValue::from_static("false"),
+                );
+            }
             Ok(
-                layer::Response::new(response.status(), response.headers().clone(), body)
-                    .with_events(StreamPayments {
+                layer::Response::new(response.status(), headers, body).with_events(
+                    StreamPayments {
                         mpp: self.clone(),
                         url: request.url,
-                    }),
+                    },
+                ),
             )
         })
     }
+}
+
+async fn buffered(mut body: layer::Body) -> std::result::Result<layer::Body, layer::Error> {
+    use nanocode_sync::stream::StreamExt as _;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|error| {
+            layer::Error::new(format!("the paid response broke while reading: {error}"))
+        })?;
+        if bytes.len() + chunk.len() > PAID_RESPONSE_BYTES_MAX {
+            return Err(layer::Error::new(format!(
+                "the paid response exceeds {PAID_RESPONSE_BYTES_MAX} bytes"
+            )));
+        }
+        bytes.extend(chunk);
+    }
+    Ok(Box::pin(nanocode_sync::stream::once(
+        async move { Ok(bytes) },
+    )))
 }
 
 struct StreamPayments {
@@ -218,6 +264,7 @@ struct NextExchange<'a> {
     next: Next<'a>,
     client: nanocode_http::Client,
     body: Option<layer::Body>,
+    paid: bool,
 }
 
 impl Exchange for NextExchange<'_> {
@@ -231,6 +278,12 @@ impl Exchange for NextExchange<'_> {
         &mut self,
         request: nanocode_http::Request,
     ) -> std::result::Result<nanocode_http::Response, layer::Error> {
+        self.paid |= request.headers().values().any(|value| {
+            value
+                .as_bytes()
+                .get(..PAYMENT_SCHEME.len())
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(PAYMENT_SCHEME.as_bytes()))
+        });
         let sent = layer::Request {
             method: request.method().clone(),
             url: request.url().to_string(),
@@ -1468,7 +1521,8 @@ impl Tempo {
                 },
             ),
             (xgate_messages.clone(), None),
-        );
+        )
+        .per_purchase();
         let unsponsored = Terms {
             gas: match terms.gas {
                 Gas::Challenge => Gas::Held,
@@ -1548,8 +1602,14 @@ impl Tempo {
         (self.xgate)()
     }
 
-    pub(crate) fn xgate_limits(&self) -> ClaudeHook {
+    pub(crate) fn xgate_limits(&self, hedge: nanocode::hedge::HedgePolicy) -> ClaudeHook {
         let catalog = self.xgate_catalog.clone();
+        let unhedged = Arc::new(nanocode::hedge::Hedging::new(
+            nanocode::hedge::HedgePolicy {
+                cap_percent: 0,
+                ..hedge
+            },
+        ));
         Arc::new(move |builder| {
             let model = builder.selected_model().to_owned();
             let limits = catalog
@@ -1570,7 +1630,8 @@ impl Tempo {
                 })?;
             Ok(builder
                 .max_tokens(limits.output_tokens)
-                .context_window_tokens(limits.context_tokens))
+                .context_window_tokens(limits.context_tokens)
+                .hedging(unhedged.clone()))
         })
     }
 
