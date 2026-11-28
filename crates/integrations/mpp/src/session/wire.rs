@@ -71,6 +71,18 @@ impl SessionRequest {
         self.detail("operator")
     }
 
+    pub(crate) fn min_deposit(&self) -> Result<Option<u128>, Fault> {
+        self.detail("router")
+            .and_then(|router| router.get("minDeposit"))
+            .map(|value| {
+                value
+                    .as_str()
+                    .and_then(|text| text.parse().ok())
+                    .ok_or_else(|| Fault::config(format!("invalid router.minDeposit: {value}")))
+            })
+            .transpose()
+    }
+
     pub(crate) fn session_protocol(&self) -> Option<&str> {
         self.detail("sessionProtocol")?.as_str()
     }

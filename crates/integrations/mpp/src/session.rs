@@ -160,6 +160,34 @@ impl Drop for Funding {
 struct TopUpSize {
     chunk: u128,
     floor: u128,
+    shortfall: u128,
+}
+
+#[derive(Clone, Copy)]
+enum DepositBound {
+    Configured,
+    KeyLimit,
+    Balance,
+}
+
+impl DepositBound {
+    fn refusal(self, token: Address, bound: u128, needed: u128) -> Fault {
+        match self {
+            Self::Configured => Fault::config(format!(
+                "the configured deposit cap {bound} of {token} is below the {needed} this payment needs"
+            )),
+            Self::KeyLimit => Fault::SpendingLimitExceeded {
+                token: token.to_string(),
+                limit: bound.to_string(),
+                required: needed.to_string(),
+            },
+            Self::Balance => Fault::TokenBalance {
+                token: token.to_string(),
+                available: bound.to_string(),
+                required: needed.to_string(),
+            },
+        }
+    }
 }
 
 struct PreparedTopUp {
@@ -663,6 +691,7 @@ impl SessionProvider {
         Ok(Some(TopUpSize {
             chunk: self.top_up_chunk(suggested, required).max(shortfall),
             floor: shortfall.max(self.top_up_amount.unwrap_or(suggested)),
+            shortfall,
         }))
     }
 
@@ -680,6 +709,21 @@ impl SessionProvider {
         channel_id: &str,
         size: TopUpSize,
     ) -> Result<PreparedTopUp, Fault> {
+        let token = session_request(challenge)?
+            .currency
+            .parse()
+            .map_err(|_| Fault::config("invalid currency address"))?;
+        let size = match self.deposit_bound(token).await? {
+            Some((bound, cap)) if size.shortfall > cap => {
+                return Err(bound.refusal(token, cap, size.shortfall));
+            }
+            Some((_, cap)) => TopUpSize {
+                chunk: size.chunk.min(cap),
+                floor: size.floor.min(cap),
+                ..size
+            },
+            None => size,
+        };
         match self
             .prepare_top_up(headers.clone(), challenge, channel_id, size.chunk)
             .await
@@ -1229,6 +1273,7 @@ impl SessionProvider {
         let size = TopUpSize {
             chunk: self.top_up_chunk(suggested, entry.cumulative_amount),
             floor: amount,
+            shortfall: 0,
         };
         let reserve = price.saturating_mul(u128::from(self.prepaid_requests) + 1);
         if entry.deposit.saturating_sub(entry.cumulative_amount) >= reserve {
@@ -2222,13 +2267,92 @@ impl SessionProvider {
         Ok(())
     }
 
-    fn resolve_deposit(&self, suggested: Option<&str>) -> Result<u128, Fault> {
-        let suggested = suggested.and_then(|text| text.parse::<u128>().ok());
-        suggested.or(self.default_deposit).ok_or_else(|| {
-            Fault::config(
-                "No deposit amount available. Set \x60default_deposit\x60, \x60max_deposit\x60, or ensure the server challenge includes \x60suggestedDeposit\x60.",
-            )
-        })
+    async fn resolve_deposit(
+        &self,
+        request: &SessionRequest,
+        amount: u128,
+        currency: Address,
+    ) -> Result<u128, Fault> {
+        let suggested = request
+            .suggested_deposit
+            .as_deref()
+            .and_then(|text| text.parse::<u128>().ok());
+        let bound = self.deposit_bound(currency).await?;
+        let deposit = suggested
+            .into_iter()
+            .chain(bound.map(|(_, cap)| cap))
+            .min()
+            .ok_or_else(|| {
+                Fault::config(
+                    "No deposit amount available. Set \x60default_deposit\x60, \x60max_deposit\x60, or ensure the server challenge includes \x60suggestedDeposit\x60.",
+                )
+            })?;
+        let needed = amount.max(request.min_deposit()?.unwrap_or_default());
+        match bound {
+            Some((bound, cap)) if cap < needed => Err(bound.refusal(currency, cap, needed)),
+            _ if deposit < needed => Err(Fault::config(format!(
+                "opening deposit {deposit} below the {needed} this payment needs"
+            ))),
+            _ => Ok(deposit),
+        }
+    }
+
+    async fn deposit_bound(&self, token: Address) -> Result<Option<(DepositBound, u128)>, Fault> {
+        let mut bounds = Vec::new();
+        bounds.extend(
+            self.default_deposit
+                .map(|cap| (DepositBound::Configured, cap)),
+        );
+        bounds.extend(
+            self.key_limit(token)
+                .await?
+                .map(|cap| (DepositBound::KeyLimit, cap)),
+        );
+        if self.autoswap.is_none() {
+            let balance = tx::balance_of(&self.rpc, token, self.payer())
+                .await
+                .map_err(|error| Fault::http(format!("failed to query balance: {error}")))?;
+            bounds.push((
+                DepositBound::Balance,
+                balance.to_u128().unwrap_or(u128::MAX),
+            ));
+        }
+        Ok(bounds.into_iter().min_by_key(|(_, cap)| *cap))
+    }
+
+    async fn key_limit(&self, token: Address) -> Result<Option<u128>, Fault> {
+        let TempoSigningMode::Keychain {
+            wallet,
+            key_authorization,
+            ..
+        } = &self.signing_mode
+        else {
+            return Ok(None);
+        };
+        let key_id = self.signer.address();
+        let rpc =
+            |error: tx::CallError| Fault::http(format!("failed to query the access key: {error}"));
+        let key = tx::get_key(&self.rpc, *wallet, key_id).await.map_err(rpc)?;
+        if key.key_id == key_id {
+            if !key.enforce_limits {
+                return Ok(None);
+            }
+            let remaining = tx::get_remaining_limit(&self.rpc, *wallet, key_id, token)
+                .await
+                .map_err(rpc)?;
+            return Ok(Some(remaining.to_u128().unwrap_or(u128::MAX)));
+        }
+        Ok(key_authorization
+            .as_ref()
+            .and_then(|signed| signed.authorization.limits.as_ref())
+            .map(|limits| {
+                limits
+                    .iter()
+                    .filter(|limit| limit.token == token)
+                    .map(|limit| limit.limit.to_u128().unwrap_or(u128::MAX))
+                    .min()
+                    .unwrap_or_default()
+            }))
     }
 
     async fn fund(&self, key: &str, challenge: &Challenge) -> Result<Option<Funding>, Fault> {
@@ -2523,12 +2647,7 @@ impl SessionProvider {
                 )
                 .await;
         }
-        let deposit = self.resolve_deposit(request.suggested_deposit.as_deref())?;
-        if deposit < amount {
-            return Err(Fault::config(format!(
-                "opening deposit {deposit} below request amount {amount}"
-            )));
-        }
+        let deposit = self.resolve_deposit(&request, amount, currency).await?;
         let payer = self.payer();
         let (prefix_calls, route) = self.autoswap_calls(payer, currency, deposit).await?;
         let fee_token = self.session_fee_token(&request, currency, route.as_ref())?;

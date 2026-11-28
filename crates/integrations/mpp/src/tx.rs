@@ -47,6 +47,7 @@ const SIGNATURE_TRANSFER: &str = "transfer(address,uint256)";
 pub(crate) const SIGNATURE_TRANSFER_WITH_MEMO: &str = "transferWithMemo(address,uint256,bytes32)";
 pub(crate) const SIGNATURE_APPROVE: &str = "approve(address,uint256)";
 const SIGNATURE_GET_KEY: &str = "getKey(address,address)";
+const SIGNATURE_GET_REMAINING_LIMIT: &str = "getRemainingLimit(address,address,address)";
 const SIGNATURE_QUOTE_SWAP: &str = "quoteSwapExactAmountOut(address,address,uint128)";
 const SIGNATURE_SWAP: &str = "swapExactAmountOut(address,address,uint128,uint128)";
 pub(crate) const SIGNATURE_SWAP_TO: &str = "swapTo(address,uint256,address,address,bytes32)";
@@ -663,6 +664,27 @@ fn low_u64(word: &[u8; 32]) -> u64 {
     let mut bytes = [0u8; U64_BYTES];
     bytes.copy_from_slice(&word[abi::WORD - U64_BYTES..]);
     u64::from_be_bytes(bytes)
+}
+
+pub(crate) async fn get_remaining_limit(
+    rpc: &Rpc,
+    account: Address,
+    key_id: Address,
+    token: Address,
+) -> Result<U256, CallError> {
+    let input = abi::call(
+        SIGNATURE_GET_REMAINING_LIMIT,
+        &[
+            Token::Address(account),
+            Token::Address(key_id),
+            Token::Address(token),
+        ],
+    );
+    let output =
+        contract_call(rpc, ACCOUNT_KEYCHAIN_ADDRESS, input, "getRemainingLimit", 1).await?;
+    abi::Decoder::new(&output)
+        .uint()
+        .map_err(|_| CallError::Overrun)
 }
 
 pub(crate) async fn get_key(
