@@ -748,6 +748,7 @@ struct Terms {
     deposit: Option<u128>,
     variant: Option<String>,
     close: Close,
+    autoswap: bool,
 }
 
 impl Terms {
@@ -758,6 +759,7 @@ impl Terms {
             deposit,
             variant: None,
             close,
+            autoswap: true,
         })
     }
 
@@ -790,6 +792,7 @@ impl Terms {
             deposit: Some(args.tempo_deposit.unwrap_or(2 * MACH)),
             variant: (currency != machine).then_some(wanted),
             close: Close::on_exit(args, Close::Responses),
+            autoswap: true,
         })
     }
 }
@@ -872,9 +875,12 @@ impl Wallet {
             })?
             .with_expected_chain_id(CHAIN_ID)
             .with_preferred_currency(self.terms.currency)
-            .with_autoswap(AutoswapConfig::default())
             .with_session_prepaid_requests(PREPAID_REQUESTS)
             .with_session_events(self.payments.events.clone());
+        let wallet = match self.terms.autoswap {
+            true => wallet.with_autoswap(AutoswapConfig::default()),
+            false => wallet,
+        };
         let wallet = match self.terms.deposit {
             Some(deposit) => wallet
                 .with_session_default_deposit(deposit)
@@ -895,11 +901,20 @@ impl Wallet {
             && error.is_insufficient_balance()
             && !*self.payments.short.set(true)
         {
+            let host = self.url.host_str().unwrap_or_default();
+            let advice = match (self.terms.autoswap, error) {
+                (false, Fault::TokenBalance { token, .. }) => format!(
+                    "{host} takes {} as it is and nanocode swaps nothing for it, so add {0} to the account",
+                    symbol(token, self.payments.ledger.read(|ledger| ledger.machine))
+                ),
+                _ => {
+                    "/fund buys MACH by card, and nanocode pays with it once it arrives".to_owned()
+                }
+            };
             notify(
                 &self.payments.listeners,
                 Some(format!(
-                    "the Tempo account holds too little to pay {} ({error}); /fund buys MACH by card, and nanocode pays with it once it arrives",
-                    self.url.host_str().unwrap_or_default()
+                    "the Tempo account holds too little to pay {host} ({error}); {advice}"
                 )),
             );
         }
@@ -1517,6 +1532,7 @@ impl Tempo {
                 &nanocode_http::Url::parse(XGATE)?,
                 &Terms {
                     close: Close::Keep,
+                    autoswap: false,
                     ..terms.clone()
                 },
             ),
